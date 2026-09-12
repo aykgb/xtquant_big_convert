@@ -4848,7 +4848,11 @@ class BigQmtXtTrader:
 
     def stop(self):
         self._stop_own()
-        self.client.stop()
+        # 交易会话结束才关共享 client（xtdata.stop() 不关，见那边的说明）；
+        # client 可以是只实现 call 的替身，没有就没得关。
+        stop = getattr(self.client, "stop", None)
+        if callable(stop):
+            stop()
         return 0
 
     def _stop_own(self):
@@ -6881,7 +6885,8 @@ class BigQmtXtTrader:
                 "order_sysid": self._resolve_order_sys_id(order_sysid),
             }, account),
             account_id=account_id,
-            client_request_id=client_request_id,
+            **({} if client_request_id is None
+               else {"client_request_id": client_request_id})
         ) or {}
         return 0 if bool(data.get("success", data)) else -1
 
