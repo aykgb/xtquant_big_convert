@@ -26,11 +26,11 @@ description: "通过统一 CLI 脚本驱动大 QMT 迅投量化交易端的全�
 ### 第 1 步：客户端安装包
 
 ```bash
-pip install "xtquant-big-convert[redis]"   # redis 传输（默认，推荐）
-# 或 zmq 同机低延迟：pip install xtquant-big-convert（基础版已含 pyzmq）
+uv pip install "xtquant-big-convert[redis]"   # redis 传输（默认，推荐）
+# 或 zmq 同机低延迟：uv pip install xtquant-big-convert（基础版已含 pyzmq）
 ```
 
-> 没发布到 PyPI 的私有 fork 用源码安装：`git clone <repo> && cd xtquant_big_convert && pip install -e .[redis]`
+> 没发布到 PyPI 的私有 fork 用源码安装：`git clone <repo> && cd xtquant_big_convert && uv pip install -e .[redis]`
 
 ### 第 2 步：把服务端文件同步到 QMT 的 python 目录
 
@@ -46,7 +46,7 @@ BIGQMT_REDIS_DRYRUN.py                 （★ QMT 编辑器入口，GBK 编码�
 pip 安装后的文件位置可以用这条命令定位（输出目录里就有全部 4 项）：
 
 ```bash
-python -c "import bigqmt_signal_trader_strategy as m, os; print(os.path.dirname(m.__file__))"
+uv run python -c "import bigqmt_signal_trader_strategy as m, os; print(os.path.dirname(m.__file__))"
 ```
 
 > QMT 沙箱若拒绝 `import redis`（部分券商白名单拦截），改用仓库里的 `bigqmt_no_redis/` 无 redis 版本（自包含 ZMQ 传输）。
@@ -106,7 +106,7 @@ $env:BIGQMT_REDIS_DB="5"; $env:BIGQMT_REDIS_PASSWORD="Redis密码"
 然后验证（redis ~3ms / zmq+drain ~16ms 为正常，实测口径见 README 传输对比表）：
 
 ```bash
-python scripts/qmt.py ping
+uv run python scripts/qmt.py ping
 ```
 
 ### 部署排错速查
@@ -124,7 +124,7 @@ python scripts/qmt.py ping
 ### 第 0 步：确认连通性
 
 ```bash
-python scripts/qmt.py ping
+uv run python scripts/qmt.py ping
 ```
 
 返回 `ok: true` 且 `latency_ms` 合理（redis ~3ms / zmq+drain ~16ms）即表示服务端就绪。
@@ -132,7 +132,7 @@ python scripts/qmt.py ping
 ### 第 1 步：一键快照（资产+持仓+委托+成交）
 
 ```bash
-python scripts/qmt.py snapshot
+uv run python scripts/qmt.py snapshot
 ```
 
 一次 RPC 往返返回账户全景，适合快速了解当前状态。
@@ -211,10 +211,10 @@ python scripts/qmt.py snapshot
 `rpc <method> [json_params]` 可调用**任意白名单方法**（含未列出的，如 `get_l2_quote` / `call_formula` / `get_raw_financial_data` 等）：
 
 ```bash
-python scripts/qmt.py rpc get_holidays
-python scripts/qmt.py rpc get_stock_name '{"stock":"600000.SH"}'
-python scripts/qmt.py rpc get_l2_quote '{"stock_code":"600000.SH","count":5}'
-python scripts/qmt.py rpc call_formula '{"formula_name":"MA","stock_code":"600000.SH","period":"1d"}'
+uv run python scripts/qmt.py rpc get_holidays
+uv run python scripts/qmt.py rpc get_stock_name '{"stock":"600000.SH"}'
+uv run python scripts/qmt.py rpc get_l2_quote '{"stock_code":"600000.SH","count":5}'
+uv run python scripts/qmt.py rpc call_formula '{"formula_name":"MA","stock_code":"600000.SH","period":"1d"}'
 ```
 
 ## 典型工作流
@@ -225,61 +225,61 @@ python scripts/qmt.py rpc call_formula '{"formula_name":"MA","stock_code":"60000
 
 ```bash
 # 1. 看实时盘口
-python scripts/qmt.py tick 600000.SH
+uv run python scripts/qmt.py tick 600000.SH
 
 # 2. 拉最近 60 根日 K（前复权），输出含 MA5/MA20/MA60 统计
-python scripts/qmt.py kline 600000.SH --period 1d --count 60 --dividend front
+uv run python scripts/qmt.py kline 600000.SH --period 1d --count 60 --dividend front
 
 # 3. 看合约详情（名称、上市日、最小变动价位等）
-python scripts/qmt.py instrument 600000.SH
+uv run python scripts/qmt.py instrument 600000.SH
 
 # 4. 看近期龙虎榜
-python scripts/qmt.py longhubang 600000.SH --count 5
+uv run python scripts/qmt.py longhubang 600000.SH --count 5
 ```
 
 ### 场景二：持仓监控
 
 ```bash
 # 一键看全景
-python scripts/qmt.py snapshot
+uv run python scripts/qmt.py snapshot
 
 # 只看持仓（含浮动盈亏）
-python scripts/qmt.py positions
+uv run python scripts/qmt.py positions
 
 # 看可撤委托
-python scripts/qmt.py orders --cancelable
+uv run python scripts/qmt.py orders --cancelable
 ```
 
 ### 场景三：下单交易
 
 ```bash
 # 0. 先看当前价
-python scripts/qmt.py tick 600000.SH
+uv run python scripts/qmt.py tick 600000.SH
 
 # 1. 干跑确认参数
-python scripts/qmt.py buy 600000.SH 100 --price 7.50 --dry-run
+uv run python scripts/qmt.py buy 600000.SH 100 --price 7.50 --dry-run
 
 # 2. 真实下单（限价 7.50 买 100 股）
-python scripts/qmt.py buy 600000.SH 100 --price 7.50 --strategy my_strat
+uv run python scripts/qmt.py buy 600000.SH 100 --price 7.50 --strategy my_strat
 
 # 3. 确认委托进了系统
-python scripts/qmt.py orders
+uv run python scripts/qmt.py orders
 
 # 4. 需要时撤单
-python scripts/qmt.py cancel <order_sysid> --market SH
+uv run python scripts/qmt.py cancel <order_sysid> --market SH
 ```
 
 ### 场景四：批量行情分析
 
 ```bash
 # 同时看多只股票的盘口
-python scripts/qmt.py tick 600000.SH 000001.SZ 600519.SH
+uv run python scripts/qmt.py tick 600000.SH 000001.SZ 600519.SH
 
 # 看板块成分股
-python scripts/qmt.py sector "沪深A股"
+uv run python scripts/qmt.py sector "沪深A股"
 
 # 看北向资金流向
-python scripts/qmt.py north
+uv run python scripts/qmt.py north
 ```
 
 ## 安全须知
@@ -353,7 +353,7 @@ python scripts/qmt.py north
 **通用兜底**：
 - `rpc <method> [json_params]` — 调用任意白名单方法（未列出的方法都能这样调）
 
-**配置自动发现**：脚本会自动把仓库 `src/` 加入 `sys.path`（开发模式直接运行，无需 pip install），并自动发现 QMT 的 python 目录（读 `local_config.py` 里的 transport 配置）。配置从环境变量（`BIGQMT_ACCOUNT_ID`/`BIGQMT_REDIS_HOST` 等）或配置文件读取。
+**配置自动发现**：脚本会自动把仓库 `src/` 加入 `sys.path`（开发模式直接运行，无需 uv pip install），并自动发现 QMT 的 python 目录（读 `local_config.py` 里的 transport 配置）。配置从环境变量（`BIGQMT_ACCOUNT_ID`/`BIGQMT_REDIS_HOST` 等）或配置文件读取。
 
 **输出格式**：默认 JSON（`ok`/`data`/`ts` 三字段），加 `--table` 切换表格输出。错误返回 `ok: false` + `error`/`detail`/`code`，退出码 1。
 

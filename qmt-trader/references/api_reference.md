@@ -46,7 +46,7 @@ xtdata.get_full_tick(code_list)
 - **参数**: `code_list: list[str]`，如 `["000001.SZ", "600000.SH"]`；也支持整市场 `["SH"]`, `["SZ"]`
 - **返回**: `dict[code -> dict]`，每只含 `lastPrice`/`open`/`high`/`low`/`lastClose`/`volume`/`amount`/
   `bidPrice`(10档)/`askPrice`(10档)/`bidVol`/`askVol`/`time`/`stime`
-- **CLI**: `python qmt.py tick 600000.SH 000001.SZ`
+- **CLI**: `uv run python qmt.py tick 600000.SH 000001.SZ`
 - **注意**: 整市场快照数据量大（5000+ 股），超时自动设 30 秒
 
 ### 2.2 get_market_data_ex — K线/历史行情
@@ -65,7 +65,7 @@ xtdata.get_market_data_ex(
 ```
 
 - **返回**: `dict[code -> pandas.DataFrame]`，index 是时间戳字符串，列含 `time`(epoch ms)/`open`/`high`/`low`/`close`/`volume`/`amount`
-- **CLI**: `python qmt.py kline 600000.SH --period 1d --count 60 --dividend front`
+- **CLI**: `uv run python qmt.py kline 600000.SH --period 1d --count 60 --dividend front`
 - **自愈**: 请求复权但服务端缺原始数据时（返回全 0），自动触发下载+重试
 - **陷阱**: 前/后复权必须先在服务端下载原始数据，否则返回全 0（已自愈但仍可能首次慢）
 
@@ -76,7 +76,7 @@ xtdata.get_instrument_detail(stock_code)  # 别名 get_instrumentdetail
 ```
 
 - **返回**: `dict`，含名称/上市日/合约乘数/最小变动价位等约 30 字段
-- **CLI**: `python qmt.py instrument 600000.SH`
+- **CLI**: `uv run python qmt.py instrument 600000.SH`
 
 ### 2.4 get_stock_list_in_sector — 板块成分股
 
@@ -85,7 +85,7 @@ xtdata.get_stock_list_in_sector(sector_name)  # 如 "沪深A股", "科创板", "
 ```
 
 - **返回**: `list[str]` 代码列表
-- **CLI**: `python qmt.py sector "沪深A股"`
+- **CLI**: `uv run python qmt.py sector "沪深A股"`
 
 ### 2.5 get_sector_list — 板块列表
 
@@ -94,7 +94,7 @@ xtdata.get_sector_list()
 ```
 
 - **返回**: `list[str]`
-- **CLI**: `python qmt.py sector`
+- **CLI**: `uv run python qmt.py sector`
 - **注意**: 大 QMT 环境 fallback 返回 13 个常用板块名（非完整列表）
 
 ### 2.6 get_trading_dates — 交易日历
@@ -103,7 +103,7 @@ xtdata.get_sector_list()
 xtdata.get_trading_dates(market="SH", start_time="", end_time="", count=-1)
 ```
 
-- **CLI**: `python qmt.py trading-dates --count 10`
+- **CLI**: `uv run python qmt.py trading-dates --count 10`
 
 ### 2.7 get_north_finance_change — 北向资金
 
@@ -111,7 +111,7 @@ xtdata.get_trading_dates(market="SH", start_time="", end_time="", count=-1)
 xtdata.get_north_finance_change(period="1d")
 ```
 
-- **CLI**: `python qmt.py north`
+- **CLI**: `uv run python qmt.py north`
 
 ### 2.8 get_longhubang — 龙虎榜
 
@@ -120,7 +120,7 @@ xtdata.get_longhubang(stock_list=["600000.SH"], start_time="", end_time="", coun
 ```
 
 - **返回**: `pandas.DataFrame`
-- **CLI**: `python qmt.py longhubang 600000.SH --count 5`
+- **CLI**: `uv run python qmt.py longhubang 600000.SH --count 5`
 
 ### 2.9 get_financial_data — 财务数据
 
@@ -132,7 +132,7 @@ xtdata.get_financial_data(
 )
 ```
 
-- **CLI**: `python qmt.py financial 000001.SZ --tables Capital.CAPITAL`
+- **CLI**: `uv run python qmt.py financial 000001.SZ --tables Capital.CAPITAL`
 
 ### 2.10 download_history_data2 — 下载历史数据
 
@@ -144,7 +144,7 @@ xtdata.download_history_data2(
 ```
 
 - **返回**: `{"finished": N, "total": M}`
-- **CLI**: `python qmt.py download 600654.SH --period 1d --start 20240101 --dividend front`
+- **CLI**: `uv run python qmt.py download 600654.SH --period 1d --start 20240101 --dividend front`
 
 ### 2.11 subscribe_whole_quote — 全推行情订阅
 
@@ -155,7 +155,7 @@ xtdata.unsubscribe_quote(sub_id)
 ```
 
 - **机制**: 服务端真推送（非轮询），增量推送有变化的品种
-- **CLI**: `python qmt.py quote-subscribe SH SZ --max 10 --timeout 30`
+- **CLI**: `uv run python qmt.py quote-subscribe SH SZ --max 10 --timeout 30`
 - **心跳**: 客户端 3 秒一次 keepalive，服务端重启后自动恢复
 
 ---
@@ -169,7 +169,7 @@ asset = xt_trader.query_stock_asset(acc)
 ```
 
 - **返回属性**: `account_id` / `cash`(可用现金) / `frozen_cash` / `total_asset` / `market_value`
-- **CLI**: `python qmt.py account`
+- **CLI**: `uv run python qmt.py account`
 - **容错**: RPC 失败时从 Redis 缓存 `bigqmt:positions:{account_id}` 读取
 
 ### 3.2 query_stock_positions — 查询全部持仓
@@ -180,7 +180,7 @@ positions = xt_trader.query_stock_positions(acc)
 
 - **返回属性**: `stock_code` / `stock_name` / `volume`(总持仓) / `can_use_volume`(可用) /
   `avg_price`(成本) / `price`(最新价) / `market_value` / `frozen_volume` / `yesterday_volume`
-- **CLI**: `python qmt.py positions [code]`
+- **CLI**: `uv run python qmt.py positions [code]`
 
 ### 3.3 query_stock_position — 查询单只持仓
 
@@ -198,7 +198,7 @@ orders = xt_trader.query_stock_orders(acc, cancelable_only=False, strategy_name=
 
 - **返回属性**: `stock_code` / `order_type`(23=BUY,24=SELL) / `order_status` /
   `order_volume` / `traded_volume` / `price` / `order_sysid` / `order_remark`
-- **CLI**: `python qmt.py orders [--cancelable] [--strategy ""]`
+- **CLI**: `uv run python qmt.py orders [--cancelable] [--strategy ""]`
 - **⚠️ strategy_name 陷阱**: 下单时的 strategy_name 必须和查询时一致。服务端默认 `""` 返回全部；
   客户端 `BigQmtXtTrader` 默认 `"bigqmt_signal_trader"`。用 `""` 查全部最安全。
 
@@ -210,7 +210,7 @@ trades = xt_trader.query_stock_trades(acc, strategy_name="")
 
 - **返回属性**: `stock_code` / `order_type` / `traded_volume` / `traded_price` /
   `traded_at` / `order_sysid` / `trade_id`
-- **CLI**: `python qmt.py trades`
+- **CLI**: `uv run python qmt.py trades`
 
 ### 3.6 委托状态码
 
@@ -252,8 +252,8 @@ order_id = xt_trader.order_stock(
 ```
 
 - **返回**: `order_sys_id`(字符串) 或 `-1`(失败)
-- **CLI**: `python qmt.py buy 600000.SH 100 --price 7.50 [--strategy s] [--remark r]`
-- **CLI**: `python qmt.py sell 600000.SH 100 --price 7.50`
+- **CLI**: `uv run python qmt.py buy 600000.SH 100 --price 7.50 [--strategy s] [--remark r]`
+- **CLI**: `uv run python qmt.py sell 600000.SH 100 --price 7.50`
 - **⚠️ 权限**: 服务端默认 `rpc_allow_order_methods=False`，必须显式开启才能下单
 - **⚠️ 超时**: 超时后委托可能已提交，先查 `query_orders` 确认，避免重复下单
 
@@ -298,7 +298,7 @@ success = xt_trader.cancel_order_stock_sysid(acc, market, order_sysid)
 # market: "SH" / "SZ" / ""
 ```
 
-- **CLI**: `python qmt.py cancel <order_sysid> --market SH`
+- **CLI**: `uv run python qmt.py cancel <order_sysid> --market SH`
 
 ### 5.2 cancel_order_stock
 
