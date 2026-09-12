@@ -43,9 +43,16 @@ class WholeQuoteClientSession(object):
         self._heartbeat_thread = None
         self._last_push_time = None  # monotonic time of last incoming push
         self._replay_pending = False  # a failed batch must finish despite other subscriptions pushing
+        self._generation = 0
+        self._last_heartbeat_time = None
+        self._last_heartbeat_error = ""
+        self._consecutive_heartbeat_failures = 0
+        self._last_replay_time = None
 
     # -- subscription lifecycle ---------------------------------------------
     def subscribe_whole_quote(self, code_list, callback=None):
+        import time
+
         codes = [str(c) for c in (code_list or []) if str(c or "").strip()]
         if not codes:
             raise ValueError("code_list is required")
@@ -58,6 +65,10 @@ class WholeQuoteClientSession(object):
         topic = str(result.get("topic") or result.get("combo_key") or _norm_topic(codes))
         with self._lock:
             self._subscriptions[sub_id] = {"topic": topic, "callback": callback, "codes": codes}
+            # A subscribe that round-tripped is the same evidence a keepalive
+            # gives; without stamping it here status() reports not-ready for a
+            # whole heartbeat interval after every successful subscribe.
+            self._last_heartbeat_time = time.monotonic()
             self._sync_subscriber_locked()
         return sub_id
 
@@ -80,6 +91,8 @@ class WholeQuoteClientSession(object):
     def replay_subscriptions(self):
         """Re-send subscribe for every active sub_id (server restart recovery).
         Idempotent on the server (keyed by client_id+combo), so replays are safe."""
+        import time
+
         with self._lock:
             items = [(sid, dict(entry)) for sid, entry in self._subscriptions.items()]
             self._replay_pending = True
@@ -97,6 +110,9 @@ class WholeQuoteClientSession(object):
             raise error
         with self._lock:
             self._replay_pending = False
+            self._generation += 1
+            self._last_replay_time = time.monotonic()
+            self._last_heartbeat_time = self._last_replay_time
 
     # -- heartbeat -------------------------------------------------------------
     def start(self):
@@ -113,13 +129,64 @@ class WholeQuoteClientSession(object):
             )
             self._heartbeat_thread.start()
 
-    def stop(self):
+    def stop(self, unsubscribe=True):
         with self._lock:
             self._started = False
+            sub_ids = list(self._subscriptions.keys())
+        if unsubscribe:
+            for sub_id in sub_ids:
+                try:
+                    self._rpc(
+                        "unsubscribe_whole_quote",
+                        {"client_id": self.client_id, "sub_id": sub_id})
+                except Exception:
+                    pass
+            with self._lock:
+                self._subscriptions.clear()
+                self._sync_subscriber_locked()
         thread = self._heartbeat_thread
         if thread is not None:
-            thread.join(timeout=1.0)
+            thread.join(timeout=max(1.0, self._heartbeat_interval + 0.2))
         self._heartbeat_thread = None
+
+    def status(self):
+        import time
+
+        now = time.monotonic()
+        with self._lock:
+            heartbeat_age = (
+                max(0.0, now - self._last_heartbeat_time)
+                if self._last_heartbeat_time is not None else None)
+            active = len(self._subscriptions)
+            ready = bool(
+                self._started
+                and self._subscriber_active
+                and active
+                and not self._replay_pending
+                and self._consecutive_heartbeat_failures == 0
+                and heartbeat_age is not None
+                and heartbeat_age <= max(1.0, self._heartbeat_interval * 3.0)
+            )
+            return {
+                "quote_ready": ready,
+                "generation": self._generation,
+                "subscriptions": active,
+                "subscriber_active": bool(self._subscriber_active),
+                "heartbeat_running": bool(
+                    self._heartbeat_thread is not None
+                    and self._heartbeat_thread.is_alive()),
+                "last_heartbeat_age_seconds": heartbeat_age,
+                "last_push_age_seconds": (
+                    max(0.0, now - self._last_push_time)
+                    if self._last_push_time is not None else None),
+                "consecutive_heartbeat_failures":
+                    self._consecutive_heartbeat_failures,
+                "last_heartbeat_error": self._last_heartbeat_error,
+                "replay_pending": bool(self._replay_pending),
+                "last_replay_age_seconds": (
+                    max(0.0, now - self._last_replay_time)
+                    if self._last_replay_time is not None else None),
+            }
 
     def _heartbeat_loop(self):
         import time
@@ -147,6 +214,12 @@ class WholeQuoteClientSession(object):
                 consecutive_failures += 1
             else:
                 consecutive_failures = 0
+            with self._lock:
+                self._consecutive_heartbeat_failures = consecutive_failures
+                self._last_heartbeat_time = time.monotonic()
+                self._last_heartbeat_error = (
+                    "%d keepalive request(s) failed" % failures
+                    if failures else "")
             # Push-silence detection: a server restart can survive with keepalive
             # succeeding (the redis request queue buffers during the restart
             # window) while the subscription table was reset, so pushes stop.
@@ -213,6 +286,7 @@ class WholeQuoteClientSession(object):
         self._channel.start_subscriber(topics, self._on_push)
         self._subscriber_active = True
         self._subscribed_topics = active
+        self._generation += 1
 
     def _next_sub_id(self):
         if self._sub_id_func is not None:

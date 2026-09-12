@@ -3,6 +3,59 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.41] - 2026-09-12
+
+给下游网关补齐"迁移先决改造"四件事：握手契约、分通道健康与连接代次、跨重启的委托幂等、
+带游标的回报回放。都是**新增**能力，老客户端不受影响；但 0.3.41 的客户端会要求服务端也是
+0.3.41——握手里少了协议版本或启动代次一律 fail-closed，所以升级客户端必须同时同步 QMT 端。
+
+### 新增
+
+- **握手契约**：`ping` 与新增的 `get_bridge_status`（只读方法，不排队到 adjust 线程）返回
+  协议版本、脱敏账号、实际 transport（redis 时带 db 与脱敏通道名）、RPC/行情/回报/持仓的
+  分通道支持、服务端**启动代次**与启动时间，外加结算等待预算
+  （`order_settle_timeout_seconds` / `settle_orders_inline`）——客户端要把自己的 RPC 预算
+  排在它之上，否则"已受理"和"结果未知"会在两侧分叉。
+
+  代次挂在 handlers 上而不是 service 上：多账号部署用同一套 handlers 建多个 service，
+  它们一起重启；脱敏账号按**请求里的账号**回答，不跟着最后一个建好的 service 走。
+
+- **客户端分通道健康**（`BigQmtRpcClient.get_status()` / `BigQmtXtData.get_status()` /
+  `BigQmtXtTrader.get_status()`）：`rpc_ready`、`quote_ready`、`trade_events_ready`、
+  `position_ready` 各自带代次、最后成功时间和错误，不再只有一个 `connected` 布尔值。
+  `rpc_ready` 由 3 秒心跳维持，10 秒没有成功心跳就不再算通——"上次成功过"不是"现在通着"。
+  FormulaServer 回落次数与本地缓存命中率进 `formula_server` / `local_cache`，并单列
+  `quote_degraded`：这两条读旁路失败会静默回落 RPC，不单独当故障态，但必须看得见。
+
+- **跨重启的委托幂等**：请求带 `client_request_id` 时，服务端按（账号，交易日，请求体摘要）
+  在 Redis 上落幂等记录——同 ID 同请求体重放已知结果、不再调 `passorder`；同 ID 不同请求体
+  回 `CLIENT_REQUEST_ID_CONFLICT`；跨交易日复用回 `CLIENT_REQUEST_ID_CROSS_DAY`（既不当重复
+  委托也不当新请求）；**幂等记录写不下去就不下单**（`IDEMPOTENCY_STORE_UNAVAILABLE`），
+  内存去重（#245）只是加速，不是保护。
+
+  结果三分：`rejected`（能证明 `passorder` 之前失败）、`accepted`、`ambiguous`（证明不了
+  原生调用没发生，一律不自动重发）。判据是适配层新增的 `_last_submit_attempted` /
+  `_last_cancel_attempted`——它们在调原生函数前一行才置 True，不解析错误文本。
+  客户端把这三种结果抛成 `RpcOrderRejectedError` / `RpcOrderAmbiguousError` /
+  `RpcOrderConflictError`；下单 RPC 超时也抛 ambiguous 而不是裸 `TimeoutError`。
+
+- **带游标的回报回放**：order / trade / order_error / cancel_error / position 五条流按消费者
+  持久化游标回放，pub/sub 只当叫醒。游标只由**投递成功**推进，回调没接住的事件下一轮再来。
+  两种补不出来的情形分开处理：有游标但够不着最老一条 = 缺口，从还留着的最老一条接着投；
+  没有游标（冷启动）= 从流尾开始，改用全量查询对账——流保留一整天，把这一天重投给全新的
+  消费者是凭空造事件，不是恢复。两种都要求全量对账，`reconcile_events()` 返回快照本身。
+
+- **生命周期**：`BigQmtRpcClient.stop()` 停心跳线程、连接池、transport 与 Redis，可重复调用；
+  `BigQmtXtData.stop()` 只停自己的订阅和 `run()` 循环，**不碰共享的 client**（`configure()`
+  把同一个 client 交给 xtdata 和 xt_trader，在这里关掉会把还在反订阅的交易会话断在半路）。
+  `run()` 改为可被唤醒的等待，不再 `sleep(3600)`。
+
+### 兼容性
+
+- redis < 5.0（没有 streams）时回报走纯 pub/sub 实时投递，`trade_events_ready` 保持 false
+  并说明原因——投得出去，但丢了就是丢了，不能声称可回放。
+- 不带 `client_request_id` 的请求行为完全不变。
+
 ## [0.3.40] - 2026-09-12
 
 两处由 @shengyy 带离线复现报告的修复：`BigQmtRpcClient(redis_config=...)` 显式传的功能开关不再被配置模块覆盖（#289）；POSITION 行缺数量字段时报错，不再补成与原生 0 无法区分的 0（#290）。

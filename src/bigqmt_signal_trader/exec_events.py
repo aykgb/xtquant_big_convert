@@ -14,6 +14,7 @@ The normalized field names match ``BigQmtXtTrader._order_from_dict`` /
 ``_trade_from_dict`` so the client can shape them straight into MiniQMT objects.
 """
 
+import hashlib
 import json
 import time
 
@@ -22,7 +23,9 @@ ORDER_CHANNEL_TEMPLATE = "bigqmt:order_events:{account_id}"
 TRADE_CHANNEL_TEMPLATE = "bigqmt:trade_events:{account_id}"
 ORDER_ERROR_CHANNEL_TEMPLATE = "bigqmt:order_error_events:{account_id}"
 CANCEL_ERROR_CHANNEL_TEMPLATE = "bigqmt:cancel_error_events:{account_id}"
+POSITION_CHANNEL_TEMPLATE = "bigqmt:position_events:{account_id}"
 ORDER_IDENTITY_KEY_TEMPLATE = "bigqmt:order_identity:{account_id}:{user_order_id}"
+EXEC_CURSOR_TTL_SECONDS = 32 * 86400
 
 EVENT_ORDER = "order"
 EVENT_TRADE = "trade"
@@ -89,6 +92,149 @@ def order_error_channel(account_id):
 
 def cancel_error_channel(account_id):
     return CANCEL_ERROR_CHANNEL_TEMPLATE.format(account_id=str(account_id or ""))
+
+
+def position_channel(account_id):
+    return POSITION_CHANNEL_TEMPLATE.format(account_id=str(account_id or ""))
+
+
+def event_stream_channels(account_id):
+    return {
+        EVENT_ORDER: order_channel(account_id),
+        EVENT_TRADE: trade_channel(account_id),
+        EVENT_ORDER_ERROR: order_error_channel(account_id),
+        EVENT_CANCEL_ERROR: cancel_error_channel(account_id),
+        "position_snapshot": position_channel(account_id),
+    }
+
+
+def _stream_id_text(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def _stream_id_tuple(value):
+    text = _stream_id_text(value or "0-0")
+    left, _dash, right = text.partition("-")
+    try:
+        return int(left), int(right or 0)
+    except (TypeError, ValueError):
+        return 0, 0
+
+
+def _cursor_key(account_id, consumer_id):
+    digest = hashlib.sha256(str(consumer_id or "").encode("utf-8")).hexdigest()[:24]
+    account = hashlib.sha256(str(account_id or "").encode("utf-8")).hexdigest()[:16]
+    return "bigqmt:exec_cursors:%s:%s" % (account, digest)
+
+
+def load_exec_cursors(redis_client, account_id, consumer_id):
+    key = _cursor_key(account_id, consumer_id)
+    raw = redis_client.hgetall(key) or {}
+    return {
+        _stream_id_text(name): _stream_id_text(value)
+        for name, value in raw.items()
+    }
+
+
+def persist_exec_cursors(redis_client, account_id, consumer_id, cursors):
+    key = _cursor_key(account_id, consumer_id)
+    for name, value in (cursors or {}).items():
+        redis_client.hset(key, str(name), _stream_id_text(value))
+    redis_client.expire(key, EXEC_CURSOR_TTL_SECONDS)
+    return key
+
+
+def _stream_tail_id(redis_client, channel):
+    newest = redis_client.xrevrange(channel, max="+", min="-", count=1) or []
+    return _stream_id_text(newest[0][0]) if newest else "0-0"
+
+
+def read_exec_event_streams(
+        redis_client, account_id, cursors=None, count=500, block_ms=None):
+    """Read execution and full-position streams after per-stream cursors.
+
+    Two different "cannot replay" cases, both reported in ``gap_streams`` and
+    both requiring full order/trade/position reconciliation before the channel
+    may be called ready:
+
+    - a saved cursor that predates the oldest retained entry -- the missing
+      middle is gone, so delivery resumes at the oldest entry still retained;
+    - no saved cursor at all (``cold_start_streams``) -- delivery starts at the
+      stream tail. A consumer with no cursor has no claim on any past event,
+      and the streams keep a whole day (maxlen 2000, 1d TTL): replaying that
+      into a fresh consumer would re-fire a day of order and trade callbacks on
+      every restart, which is fabrication, not recovery. The full query is the
+      cold-start path.
+    """
+    channels = event_stream_channels(account_id)
+    current = dict(cursors or {})
+    gaps = []
+    cold = []
+    query = {}
+    for name, channel in channels.items():
+        cursor = _stream_id_text(current.get(name) or "")
+        if not cursor:
+            cursor = _stream_tail_id(redis_client, channel)
+            cold.append(name)
+            gaps.append(name)
+        elif cursor != "0-0":
+            oldest = redis_client.xrange(channel, min="-", max="+", count=1) or []
+            if (not oldest
+                    or _stream_id_tuple(cursor) < _stream_id_tuple(oldest[0][0])):
+                gaps.append(name)
+                cursor = "0-0"
+        query[channel] = cursor
+        current[name] = cursor
+    start = dict(current)
+    kwargs = {"count": max(1, int(count))}
+    if block_ms is not None and int(block_ms) > 0:
+        kwargs["block"] = int(block_ms)
+    rows = redis_client.xread(query, **kwargs) or []
+    by_channel = {channel: name for name, channel in channels.items()}
+    events = []
+    for raw_channel, entries in rows:
+        channel = _stream_id_text(raw_channel)
+        name = by_channel.get(channel)
+        if name is None:
+            continue
+        for stream_id, fields in entries:
+            stream_id = _stream_id_text(stream_id)
+            payload = None
+            for field, value in (fields or {}).items():
+                if _stream_id_text(field) == "payload":
+                    payload = value
+                    break
+            if isinstance(payload, bytes):
+                payload = payload.decode("utf-8")
+            try:
+                event = json.loads(str(payload or "{}"))
+            except Exception:
+                event = {"raw_payload": str(payload or "")}
+            if not isinstance(event, dict):
+                event = {"payload": event}
+            event.setdefault("event_type", name)
+            events.append({
+                "stream": name,
+                "stream_id": stream_id,
+                "event": event,
+            })
+            current[name] = stream_id
+    events.sort(key=lambda item: _stream_id_tuple(item["stream_id"]))
+    return {
+        "available": True,
+        "events": events,
+        "cursors": current,
+        # Where each stream was read FROM, after cold-start/gap resolution.
+        # A consumer persists these for streams it got nothing from; it must
+        # not persist ``cursors``, which advances over events whether or not
+        # the consumer accepted them.
+        "start_cursors": start,
+        "gap_streams": sorted(gaps),
+        "cold_start_streams": sorted(cold),
+        "reconciliation_required": bool(gaps),
+    }
 
 
 def order_identity_key(account_id, user_order_id):
