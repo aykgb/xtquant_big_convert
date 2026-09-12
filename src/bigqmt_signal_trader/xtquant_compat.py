@@ -4348,7 +4348,11 @@ class BigQmtXtTrader:
         self._event_thread = None
         self._trade_events_ready = False
         self._position_ready = False
-        self.client.stop()
+        # 交易会话结束才关共享 client（xtdata.stop() 不关，见那边的说明）；
+        # client 可以是只实现 call 的替身，没有就没得关。
+        stop = getattr(self.client, "stop", None)
+        if callable(stop):
+            stop()
         return 0
 
     def get_status(self, refresh=False):
@@ -5283,10 +5287,13 @@ class BigQmtXtTrader:
         }
         if not wait_settlement:
             payload["wait_settlement"] = False
+        # 只在真的带幂等键时才多传这个参数：client 可以是只实现 call(method,
+        # params, account_id=...) 的替身，无条件传会把它们全打成 TypeError。
+        extra = ({} if client_request_id is None
+                 else {"client_request_id": client_request_id})
         try:
             return self.client.call(
-                "order_stock", payload, account_id=account_id,
-                client_request_id=client_request_id) or {}
+                "order_stock", payload, account_id=account_id, **extra) or {}
         except TimeoutError as exc:
             raise TimeoutError(
                 "order_stock rpc timeout; user_order_id=%s. Query orders/trades before retrying to avoid duplicate orders. %s"
@@ -6228,7 +6235,8 @@ class BigQmtXtTrader:
                 "order_sysid": self._resolve_order_sys_id(order_sysid),
             },
             account_id=account_id,
-            client_request_id=client_request_id,
+            **({} if client_request_id is None
+               else {"client_request_id": client_request_id})
         ) or {}
         return 0 if bool(data.get("success", data)) else -1
 
