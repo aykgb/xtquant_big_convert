@@ -1455,10 +1455,16 @@ class BigQmtRpcHandlers:
         return {}
 
     def _handle_quote_keepalive(self, params):
+        """Refresh the subscription and say whether it is still known here.
+
+        ``known`` is what lets the client stop guessing from push silence: no
+        push plus known=True is a quiet market, no push plus known=False is a
+        reset subscription table. Clients older than this field fall back to
+        the silence heuristic, so the answer stays optional on the wire.
+        """
         manager = self._require_quote_manager()
         client_id, sub_id, _codes = self._quote_params(params)
-        manager.keepalive(client_id, sub_id)
-        return {}
+        return {"known": bool(manager.keepalive(client_id, sub_id))}
 
     def _handle_quote_subscription_status(self, params):
         """Read-only: what is subscribed, by how many clients, and how stale.
