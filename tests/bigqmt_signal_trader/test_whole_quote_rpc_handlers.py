@@ -91,7 +91,17 @@ class WholeQuoteRpcHandlersTest(unittest.TestCase):
         handlers, _source = _handlers()
         handlers.handle("subscribe_whole_quote", {"client_id": "c1", "sub_id": "s1", "codes": ["SH"]})
         result = handlers.handle("quote_keepalive", {"client_id": "c1", "sub_id": "s1"})
-        self.assertEqual(result, {})
+        self.assertEqual(result, {"known": True})
+
+    def test_quote_keepalive_reports_an_unknown_subscription(self):
+        """The client cannot tell a quiet market from a reset table without this.
+
+        Guessing from push silence calls every closed session a failure and
+        replays forever outside trading hours.
+        """
+        handlers, _source = _handlers()
+        result = handlers.handle("quote_keepalive", {"client_id": "c1", "sub_id": "never-subscribed"})
+        self.assertEqual(result, {"known": False})
 
     def test_quote_methods_rejected_without_manager(self):
         handlers, _source = _handlers(with_manager=False)

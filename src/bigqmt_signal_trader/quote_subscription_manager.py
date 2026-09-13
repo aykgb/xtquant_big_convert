@@ -219,16 +219,24 @@ class QuoteSubscriptionManager(object):
         self._close_source(handle_to_close)
 
     def keepalive(self, client_id, sub_id):
-        """Refresh last_seen for (client_id, sub_id). Unknown sub_ids are a no-op."""
+        """Refresh last_seen for (client_id, sub_id). Unknown sub_ids are a no-op.
+
+        Returns whether this subscription is still known here. The caller needs
+        that answer: a client cannot otherwise tell "my subscription is alive,
+        the market is simply quiet" from "the table was reset and I am getting
+        nothing", and guessing from push silence calls every closed session a
+        failure.
+        """
         client_id = str(client_id or "")
         key = self._sub_index.get((client_id, str(sub_id or "")))
         if key is None:
-            return
+            return False
         with self._lock:
             combo = self._combos.get(key)
             if combo is None:
-                return
+                return False
             combo.clients[(client_id, str(sub_id or ""))] = self._now()
+        return True
 
     # -- reaper ---------------------------------------------------------------
     def reap_expired(self, now=None):

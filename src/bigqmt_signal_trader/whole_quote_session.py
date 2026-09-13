@@ -21,19 +21,29 @@ def _norm_topic(code_list):
 
 class WholeQuoteClientSession(object):
     def __init__(self, rpc_call, push_channel, client_id, heartbeat_interval_seconds=3.0, sub_id_func=None,
-                 push_silence_replay_heartbeats=10):
+                 push_silence_replay_heartbeats=10, max_silence_replay_backoff=16):
         """``rpc_call`` is ``client.call``-shaped: fn(method, params) -> dict.
         ``push_channel`` is a QuotePushChannel used purely as a subscriber.
         ``sub_id_func`` (optional) mints subscription ids; defaults to a counter.
         ``push_silence_replay_heartbeats``: after this many heartbeat rounds
         without any push, replay subscriptions (covers server restarts where
         keepalive keeps succeeding because the redis request queue buffers
-        during the restart window but the subscription table was reset)."""
+        during the restart window but the subscription table was reset).
+
+        That silence rule is only a fallback now. A server that answers
+        keepalive with ``known`` states outright whether it still holds the
+        subscription, which separates "quiet market" from "table was reset" --
+        silence alone cannot, and treating every quiet stretch as a failure
+        replays forever outside trading hours. When no server answers with
+        ``known``, the silence fallback backs off exponentially (doubling up to
+        ``max_silence_replay_backoff``) so a permanently quiet session settles
+        at one probe every few minutes instead of one every N rounds."""
         self._rpc = rpc_call
         self._channel = push_channel
         self.client_id = str(client_id or "")
         self._heartbeat_interval = float(heartbeat_interval_seconds)
         self._push_silence_replay_heartbeats = int(push_silence_replay_heartbeats)
+        self._max_silence_replay_backoff = max(1, int(max_silence_replay_backoff))
         self._sub_id_func = sub_id_func
         self._seq = 0
         self._lock = threading.RLock()
@@ -194,6 +204,7 @@ class WholeQuoteClientSession(object):
 
         consecutive_failures = 0
         silence_rounds = 0
+        silence_threshold = self._push_silence_replay_heartbeats
         prev_last_push = None
         while True:
             with self._lock:
@@ -205,11 +216,23 @@ class WholeQuoteClientSession(object):
                 time.sleep(self._heartbeat_interval)
                 continue
             failures = 0
+            # None = this server does not report `known` (pre-0.3.42); only then
+            # does the silence heuristic get to decide anything.
+            lost_subscription = None
             for sub_id in sub_ids:
                 try:
-                    self._rpc("quote_keepalive", {"client_id": self.client_id, "sub_id": sub_id})
+                    reply = self._rpc(
+                        "quote_keepalive", {"client_id": self.client_id, "sub_id": sub_id})
                 except Exception:
                     failures += 1
+                    continue
+                known = (reply or {}).get("known") if isinstance(reply, dict) else None
+                if known is None:
+                    continue
+                if lost_subscription is None:
+                    lost_subscription = False
+                if not known:
+                    lost_subscription = True
             recovered = not failures and consecutive_failures >= 3
             if failures:
                 consecutive_failures += 1
@@ -228,18 +251,37 @@ class WholeQuoteClientSession(object):
             # covers the case where the very first prime push never arrived).
             if last_push != prev_last_push:
                 silence_rounds = 0  # a push arrived since the last round
+                silence_threshold = self._push_silence_replay_heartbeats
             else:
                 silence_rounds += 1
             prev_last_push = last_push
             with self._lock:
                 replay_pending = self._replay_pending
-            if recovered or replay_pending or silence_rounds >= self._push_silence_replay_heartbeats:
+
+            # The server's own answer beats the guess. known=True means the
+            # subscription is alive, so silence is just a quiet market (nights,
+            # the lunch break, a halted name) and replaying would be noise --
+            # every replay bumps the generation, and downstream reads a new
+            # generation as "there is a gap in your data".
+            if lost_subscription is False:
+                silence_rounds = 0
+                silence_threshold = self._push_silence_replay_heartbeats
+            silent_too_long = (lost_subscription is None
+                               and silence_rounds >= silence_threshold)
+            if recovered or replay_pending or lost_subscription or silent_too_long:
                 # Retry the idempotent batch until every subscription succeeds.
                 # A's pushes cannot erase B's unresolved replay (#231).
                 try:
                     self.replay_subscriptions()
                 except Exception:
                     pass
+                if silent_too_long:
+                    # Still nothing to go on: probe half as often each time, so a
+                    # session that is quiet all night settles down instead of
+                    # replaying every N rounds until morning.
+                    silence_threshold = min(
+                        silence_threshold * 2,
+                        self._push_silence_replay_heartbeats * self._max_silence_replay_backoff)
                 silence_rounds = 0
             time.sleep(self._heartbeat_interval)
 
