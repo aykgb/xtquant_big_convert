@@ -5335,6 +5335,11 @@ class BigQmtXtTrader:
         while True:
             time.sleep(3600)
 
+    @staticmethod
+    def _connect_params(account):
+        name = _account_type_name(getattr(account, "account_type", None))
+        return {"account_type": name} if name in {"HUGANGTONG", "SHENGANGTONG"} else {}
+
     def query_stock_asset(self, account):
         account_id = _account_id(account, self.client.account_id)
         try:
@@ -5344,13 +5349,14 @@ class BigQmtXtTrader:
             # #243: default is to let the failure through. Only an explicit
             # account_cache_fallback, with a dated and fresh snapshot, answers
             # from cache -- and it says so in the log when it does.
-            if self._account_cache_usable(account_id, "query_stock_asset") is None:
+            if self._connect_params(account) or self._account_cache_usable(account_id, "query_stock_asset") is None:
                 raise
             data = self._cached_asset(account_id)
             if not data:
                 raise
         if (
             data.get("cash") is None
+            and not self._connect_params(account)
             and data.get("total_asset") is None
             and self._account_cache_usable(account_id, "query_stock_asset(empty)") is not None
         ):
@@ -5358,6 +5364,8 @@ class BigQmtXtTrader:
         fetch_balance = _safe_float(data.get("fetch_balance"), None)
         cash = data.get("cash")
         total_asset = data.get("total_asset")
+        if self._connect_params(account) and (cash is None or total_asset is None):
+            raise RuntimeError("Stock Connect account asset is unavailable")
         frozen_cash = data.get("frozen_cash")
         market_value = data.get("market_value")
         if market_value is None and cash is not None and total_asset is not None:
@@ -5372,7 +5380,7 @@ class BigQmtXtTrader:
             account_id=account_id,
             # xttype.XtAsset carries it. #133 added account_type to
             # order/trade/position; the asset object was missed.
-            account_type=self._account_type_value(),
+            account_type=_account_type_code(self._connect_params(account).get("account_type")) or self._account_type_value(),
             cash=_safe_float(cash, 0.0) if cash is not None else None,
             available_cash=_safe_float(cash, 0.0) if cash is not None else None,
             fetch_balance=fetch_balance,
@@ -5462,7 +5470,7 @@ class BigQmtXtTrader:
             self._note_position_status(True)
         except Exception:
             self._note_position_status(False)
-            if self._account_cache_usable(account_id, "query_stock_positions") is None:
+            if self._connect_params(account) or self._account_cache_usable(account_id, "query_stock_positions") is None:
                 raise
             data = self._cached_positions(account_id)
             if not data:

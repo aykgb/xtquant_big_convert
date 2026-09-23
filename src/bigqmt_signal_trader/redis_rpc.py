@@ -838,6 +838,8 @@ class BigQmtRpcHandlers:
             account_id or self.account_id)
         # The client orders its own RPC budget above this one (plan section 8).
         info["settle_orders_inline"] = bool(self.settle_orders_inline)
+        # 港股通 requests are answered as the type they name (account_type_map).
+        info["account_type_routing"] = True
         info["order_settle_timeout_seconds"] = float(
             self.order_settle_timeout_seconds)
         return info
@@ -3395,8 +3397,12 @@ class BigQmtRpcHandlers:
         order_sys_id = str(settlement.order_ref.order_sys_id or "")
         # Fast path: the order's own status change was pushed to us by QMT's
         # order_callback (issue #164). A table miss falls through to the poll.
+        # The table is keyed by 合同编号 alone, which a 港股通 book can share
+        # with the STOCK one: those settle from their own book's order list.
+        from .account_type_map import STOCK_CONNECT_TYPES
+
         watch = getattr(self, "order_watch_table", None)
-        if watch is not None:
+        if watch is not None and settlement.account_type not in STOCK_CONNECT_TYPES:
             try:
                 watched = watch.status_for_sysid(order_sys_id)
             except Exception:

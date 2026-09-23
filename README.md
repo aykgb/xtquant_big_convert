@@ -999,7 +999,8 @@ xt_trader.order_stock(acc_hk, "00700.HK", xtconstant.STOCK_BUY, 100, xtconstant.
 
 `StockAccount` 的类型随每个交易类请求以 `account_type` 参数传到服务端；在列表里就按它查、按它结算
 （港股通委托的合同编号回填要去 HUGANGTONG 的委托列表里找），不在列表里仍按默认答并记一次日志——部署
-的配置仍然决定这个账号是什么户（#92 那条不变）。`ping` 多报 `account_types`，客户端的「类型不一致」
+的配置仍然决定这个账号是什么户（#92 那条不变）。HUGANGTONG / SHENGANGTONG 例外：不在列表里也按它查，
+按默认答就是把 A 股资金和持仓当港股通的给出去。`ping` 多报 `account_types`，客户端的「类型不一致」
 告警只在声明的类型不在这张表里时才响。下单本身不用改：`passorder` 的 23/24 对 `.HK` 代码就是港股通
 买卖。撤单也带类型。**没有港股通权限或不用列表的部署，行为零变化。**
 

@@ -81,8 +81,10 @@ class ListValuedConfigTest(unittest.TestCase):
             self.assertEqual(account_type_for("123", "CREDIT", requested="HUGANGTONG"), "HUGANGTONG")
             self.assertEqual(account_type_for("123", "CREDIT", requested="hugangtong"), "HUGANGTONG")
             self.assertEqual(account_type_for("123", "CREDIT", requested=7), "HUGANGTONG")
-            # Not configured for it: the default answers.
-            self.assertEqual(account_type_for("123", "CREDIT", requested="SHENGANGTONG"), "STOCK")
+            # Not configured for it, but a 港股通 type: answered as itself,
+            # never from the STOCK book.
+            self.assertEqual(account_type_for("123", "CREDIT", requested="SHENGANGTONG"), "SHENGANGTONG")
+            self.assertEqual(account_type_for("123", "CREDIT", requested="FUTURE"), "STOCK")
 
     def test_primary_list_without_a_map(self):
         with _config(BIGQMT_ACCOUNT_ID="123",
@@ -92,9 +94,10 @@ class ListValuedConfigTest(unittest.TestCase):
                              ["STOCK", "HUGANGTONG", "SHENGANGTONG"])
             self.assertEqual(account_type_for("123", "STOCK"), "STOCK")
             self.assertEqual(account_type_for("123", "STOCK", requested="SHENGANGTONG"), "SHENGANGTONG")
-            # Another account id is not the primary: only the default.
+            # Another account id is not the primary: only the default is
+            # configured, yet a 港股通 request still reads its own book.
             self.assertEqual(account_types_for("999", "STOCK"), ["STOCK"])
-            self.assertEqual(account_type_for("999", "STOCK", requested="HUGANGTONG"), "STOCK")
+            self.assertEqual(account_type_for("999", "STOCK", requested="HUGANGTONG"), "HUGANGTONG")
 
     def test_plain_string_config_is_unchanged(self):
         # No list anywhere: the old contract, default returned verbatim and
@@ -103,7 +106,7 @@ class ListValuedConfigTest(unittest.TestCase):
             atm.reload()
             self.assertEqual(account_type_for("123", "credit"), "credit")
             self.assertEqual(account_type_for("123", "CREDIT", requested="STOCK"), "CREDIT")
-            self.assertEqual(account_type_for("", "STOCK", requested="HUGANGTONG"), "STOCK")
+            self.assertEqual(account_type_for("", "STOCK", requested="HUGANGTONG"), "HUGANGTONG")
 
     def test_request_scope_is_per_thread_and_nested(self):
         with _config(BIGQMT_ACCOUNT_TYPE_MAP={"123": ["STOCK", "HUGANGTONG"]}):
@@ -231,7 +234,7 @@ class _Client(object):
         if method == "query_stock_positions":
             return []
         if method == "query_stock_asset":
-            return {"cash": 1.0}
+            return {"cash": 1.0, "total_asset": 1.0}
         return {}
 
 

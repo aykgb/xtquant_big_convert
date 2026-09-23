@@ -30,7 +30,9 @@ request (a thread-local, see request_account_type(); the adjust thread and
 the heavy-read worker each carry their own). A type the account is not
 configured for is ignored, exactly as before: the deployment's config
 decides what the account trades as (#92), and the server logs the refusal
-once per (account, type).
+once per (account, type). 港股通 types are the exception: a request naming
+one is always answered as that type, since answering it from the STOCK book
+hands back A-share cash and positions without any error.
 
 Usage in gateway methods::
 
@@ -50,6 +52,7 @@ _ACCOUNT_TYPE_MAP = None  # None = not loaded yet; {} = loaded but empty
 _PRIMARY_ID = ""          # BIGQMT_ACCOUNT_ID, when the local config has it
 _PRIMARY_TYPES = []       # BIGQMT_ACCOUNT_TYPE as a list (empty unless it was a list)
 _REQUEST = threading.local()
+STOCK_CONNECT_TYPES = frozenset(["HUGANGTONG", "SHENGANGTONG"])
 _refused_logged = set()
 
 # xtconstant codes -> names, for a client that sends the number (StockAccount
@@ -166,7 +169,7 @@ def account_type_for(account_id, default_type="STOCK", requested=None):
         requested = get_request_account_type()
     wanted = normalize_account_types(requested)
     if wanted:
-        if wanted[0] in types:
+        if wanted[0] in types or wanted[0] in STOCK_CONNECT_TYPES:
             return wanted[0]
         _note_refused(account_id, wanted[0], types)
     if not account_id:

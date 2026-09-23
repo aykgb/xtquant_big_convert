@@ -43,6 +43,9 @@
   是默认：`["STOCK", "HUGANGTONG", "SHENGANGTONG"]`。客户端 `StockAccount(id, "HUGANGTONG")` 的类型
   随每个交易类请求以 `account_type` 参数传到服务端，在列表里就按它查、按它结算（委托号回填去该类型的
   委托列表找，撤单也带类型），不在列表里仍按默认答并记一次日志——部署的配置仍决定账号是什么户（#92）。
+  **例外是 HUGANGTONG / SHENGANGTONG**：不在列表里也按它查，否则拿回来的是 A 股资金和持仓且不报错；
+  这类请求的客户端不走账户缓存、资产缺字段直接报错，撤单确认不读只按合同编号索引的回调表。
+  `get_bridge_status` 多报 `account_type_routing: true`。
   `ping` 多报 `account_types`，客户端的类型不一致告警只在声明的类型不在表里时才响。不用列表的部署行为
   零变化。下单本身不用改：`passorder` 的 23/24 对 `.HK` 代码就是港股通买卖。
 

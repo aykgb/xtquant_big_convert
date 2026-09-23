@@ -57,6 +57,7 @@
   | `supports` | `rpc` / `quote` / `trade_events` / `position_events` 分通道支持 |
   | `server_generation` | 服务端**启动代次**：变了就是重启过，订阅和游标都不再代表原来的意思 |
   | `server_started_at` / `order_settle_timeout_seconds` / `settle_orders_inline` | 启动时间与结算等待预算 |
+  | `account_type_routing` | `true`：请求带 HUGANGTONG / SHENGANGTONG 时一定按该类型回答，不回退 STOCK |
   | `version` / `rpc_revision` / `python_version` / `allow_order_methods` / `account_type` | 部署自述 |
 
 - **用途**：客户端启动握手，以及桥接卡住时的状态查询——它是**只读方法**，不排到
