@@ -216,7 +216,7 @@ class WholeQuoteClientSession(object):
                 time.sleep(self._heartbeat_interval)
                 continue
             failures = 0
-            # None = this server does not report `known` (pre-0.3.42); only then
+            # None = this server does not report `known` (an older one); only then
             # does the silence heuristic get to decide anything.
             lost_subscription = None
             for sub_id in sub_ids:

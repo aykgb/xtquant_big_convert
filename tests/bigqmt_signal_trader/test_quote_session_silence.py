@@ -73,7 +73,7 @@ class SilenceWithALiveSubscriptionTest(unittest.TestCase):
 
 
 class SilenceAgainstAServerThatDoesNotAnswerTest(unittest.TestCase):
-    """Pre-0.3.42 servers return {} — the old heuristic has to keep working."""
+    """Older servers return {} — the old heuristic has to keep working."""
 
     def test_silence_still_replays_without_a_known_field(self):
         calls = []

@@ -111,7 +111,9 @@
 
 ### `quote_keepalive`
 - **参数**：`client_id`、`sub_id`（均 str，必填）。
-- **返回**：`{}`。
+- **返回**：`{"known": bool}`。`known` 表示该订阅是否仍在服务端订阅表里：
+  `true` + 无推送是行情安静，`false` 是订阅表被重置、该重订阅。老服务端返回 `{}`，
+  客户端退回推送静默启发式。
 - **语义**：刷新该订阅的 `last_seen`。client 每 `heartbeat_interval`（默认 3s）发送一次；server 端某 client 超过 `heartbeat_timeout_seconds`（默认 30s = 10 个心跳周期）无心跳则被 reaper 移除，组合清空后退订大 QMT。
 
 ---
