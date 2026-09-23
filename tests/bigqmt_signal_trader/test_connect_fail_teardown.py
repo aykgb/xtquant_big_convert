@@ -3,7 +3,7 @@
 
 实测单日 8000+ 个 subscribe 连接逼近 maxclients 的部署，根因就是重连风暴
 里每个被丢弃的实例都留着 start() 拉起的监听线程（每实例 4 个 exec 事件
-频道订阅）。修复后 connect 抛错前先 stop()。
+频道订阅）。修复后 connect 抛错前先拆掉自己的监听；不关 client，它与 xtdata 共用。
 """
 
 import os
@@ -41,20 +41,20 @@ class ConnectFailTeardownTest(unittest.TestCase):
         trader.client = _FailingClient()
 
         stops = []
-        original_stop = trader.stop
+        original_stop = trader._stop_own
 
         def spying_stop():
             stops.append(1)
             return original_stop()
 
-        trader.stop = spying_stop
+        trader._stop_own = spying_stop
         trader.start()  # start() 拉起事件监听线程（泄漏源）
         self.assertIsNotNone(trader._event_thread)
 
         with self.assertRaises(TimeoutError):
             trader.connect()
 
-        self.assertEqual(stops, [1], "connect 失败必须 stop() 拆掉监听")
+        self.assertEqual(stops, [1], "connect 失败必须拆掉监听")
         thread = trader._event_thread
         self.assertTrue(
             thread is None or not thread.is_alive(),

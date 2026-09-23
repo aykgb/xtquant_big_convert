@@ -30,7 +30,7 @@
 ### `ping`
 - **参数**：无
 - **返回**：`{"pong": True, "account_id": "...", "account_type": "STOCK", "account_types": ["STOCK", ...], "server_time": "YYYY-MM-DD HH:MM:SS"}`——`account_types` 是这个账号可按哪些类型查（`BIGQMT_ACCOUNT_TYPE` 写成列表时不止一个，港股通）
-- **用途**：探活、确认 RPC 服务在线与归属账号。
+- **用途**：探活、确认 RPC 服务在线与归属账号。同时返回下面 `get_bridge_status` 的握手契约。
 - **实测延迟**：Redis ~13ms（p50）。
 
 ### `get_request_outcome`
@@ -44,6 +44,23 @@
 - **用途**：`order_stock` 超时后问「那张单到底下没下」（#303）。只读、跑在收包线程，adjust
   线程忙着也能答；客户端兼容层的 `order_stock` 超时后会自动问一次。服务端只记下单类请求，
   保留 10 分钟。
+
+### `get_bridge_status`
+- **参数**：可选 `account_id`
+- **返回**（`ping` 也带前六项）：
+
+  | 字段 | 含义 |
+  | --- | --- |
+  | `protocol_version` | RPC 协议版本，当前 `"1.0"`；对不上客户端 fail-closed |
+  | `account_id_masked` | 脱敏账号（留后 4 位），按**请求里的账号**回答 |
+  | `transport` | 实际传输：`{"name": "redis", "db": 5, "channels": {...}}`（通道名也脱敏） |
+  | `supports` | `rpc` / `quote` / `trade_events` / `position_events` 分通道支持 |
+  | `server_generation` | 服务端**启动代次**：变了就是重启过，订阅和游标都不再代表原来的意思 |
+  | `server_started_at` / `order_settle_timeout_seconds` / `settle_orders_inline` | 启动时间与结算等待预算 |
+  | `version` / `rpc_revision` / `python_version` / `allow_order_methods` / `account_type` | 部署自述 |
+
+- **用途**：客户端启动握手，以及桥接卡住时的状态查询——它是**只读方法**，不排到
+  adjust 主线程后面，正好是要看它的时候还能答。
 
 ---
 
@@ -530,6 +547,26 @@ FormulaServer 直连不认这个参数，带上它会强制回落到 RPC 桥（�
   而不执行**，`error` 以 `RequestExpired` 开头并明确写「没下单」（#303）。下单在 QMT 策略
   线程上串行跑（每笔约 200ms），并发数 × 每笔耗时超过超时就会撞上这条——降并发或加大
   超时。撤单不受此限。
+
+#### `client_request_id`：跨重启的幂等键
+
+请求顶层（不是 `params` 里）带 `client_request_id` 时，服务端按（账号，交易日，请求体摘要）
+在 Redis 上落一条幂等记录，应答里多出 `order_outcome` 与 `error_code`：
+
+| 情形 | `order_outcome` | `error_code` |
+| --- | --- | --- |
+| 同 ID 同请求体，已有已知结果 | 原结果，附 `idempotency_replayed=true` | — |
+| 同 ID 不同请求体 | `conflict` | `CLIENT_REQUEST_ID_CONFLICT` |
+| 同 ID 出现在别的交易日 | `conflict` | `CLIENT_REQUEST_ID_CROSS_DAY` |
+| 上一次认领还没写回结果 | `ambiguous` | `ORDER_OUTCOME_AMBIGUOUS` |
+| 能证明原生调用之前就失败 | `rejected` | `ORDER_REJECTED_BEFORE_DISPATCH` |
+| 证明不了原生调用没发生 | `ambiguous` | `ORDER_OUTCOME_AMBIGUOUS` |
+| 幂等记录写不下去 | `rejected` | `IDEMPOTENCY_STORE_UNAVAILABLE` |
+| 柜台受理 | `accepted` | — |
+
+`ambiguous` **不允许自动重发**。判据是适配层调原生函数前一行才置位的
+`_last_submit_attempted` / `_last_cancel_attempted`，不解析错误文本。
+`cancel_order` 同样支持这个键。
 
 ### `cancel_order`
 - **别名**：`cancel_order_stock` / `cancel_order_stock_sysid`

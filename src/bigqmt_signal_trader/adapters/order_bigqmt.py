@@ -473,6 +473,8 @@ class BigQmtOrderGateway:
         self.combo_type = combo_type
         self.price_type = price_type
         self.quick_trade = quick_trade
+        self._last_submit_attempted = False
+        self._last_cancel_attempted = False
 
     def _resolve_account_type(self, account_id):
         """Per-request account_type: map lookup if configured, else default.
@@ -557,6 +559,7 @@ class BigQmtOrderGateway:
         return "bq:%s:%s" % (digest, text[:30])
 
     def submit(self, request):
+        self._last_submit_attempted = False
         passorder = self._require_passorder()
         action = str(request.action).upper()
         raw_order_type = getattr(request, "order_type", None)
@@ -601,6 +604,7 @@ class BigQmtOrderGateway:
 
         user_order_id = str(request.remark or "").strip() or self.build_user_order_id(request.signal_id)
         account_id = request.account_id or self.account_id
+        self._last_submit_attempted = True
         passorder(
             op_type,
             self.combo_type,
@@ -658,6 +662,7 @@ class BigQmtOrderGateway:
         later, on the order_callback push), so there is no order id to return
         synchronously -- exactly as with order_stock_async.
         """
+        self._last_submit_attempted = False
         passorder = self._require_passorder()
         args = [
             int(op_type),
@@ -678,6 +683,7 @@ class BigQmtOrderGateway:
                 "args": list(args),
                 "context_info_supplied": self.context_info is not None,
             }
+        self._last_submit_attempted = True
         passorder(*(args + [self.context_info]))
         return {
             "dry_run": False,
@@ -686,9 +692,11 @@ class BigQmtOrderGateway:
         }
 
     def cancel(self, order_ref, account_id=None):
+        self._last_cancel_attempted = False
         cancel_func = self._require_cancel()
         aid = account_id or self.account_id
         account_type = self._resolve_account_type(aid)
+        self._last_cancel_attempted = True
         ok = cancel_func(order_ref.order_sys_id, aid, account_type, self.context_info)
         return CancelResult(success=bool(ok), message="" if ok else "cancel returned false")
 

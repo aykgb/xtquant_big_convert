@@ -9,6 +9,7 @@ callback thread.
 import base64
 import collections
 import datetime as _dt
+import hashlib
 import json
 import math
 import queue
@@ -27,11 +28,13 @@ from .models import AccountSnapshot, OrderRef, OrderRequest
 _monotonic = time.monotonic
 
 
-RPC_REVISION = "20260715-execution-snapshot-v1"
+RPC_REVISION = "20260912-migration-contract-v1"
+RPC_PROTOCOL_VERSION = "1.0"
 
 
 READ_METHODS = {
     "ping",
+    "get_bridge_status",
     "get_deployment_info",
     "get_request_outcome",
     "probe_capabilities",
@@ -715,6 +718,12 @@ class BigQmtRpcHandlers:
         # Server-side diagnostic for silent failures (e.g. passorder submitted
         # but order not found in system). Surfaced to client via server_error.
         self._last_server_error = ""
+        self._order_dispatch_state = "idle"
+        # Identifies THIS bridge process to clients: a changed generation is
+        # how a client learns the server restarted, so its subscriptions and
+        # stream cursors may no longer mean what they did.
+        self.server_generation = uuid.uuid4().hex
+        self.server_started_at = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         # 上一次 hollow 告警的时间戳。节流是必须的：一个跑错线程的部署会让
         # **每一次**交易类查询都 hollow，不节流的话日志会被刷爆（#139 就是
         # 一行写了 16 次那种教训）。
@@ -797,8 +806,44 @@ class BigQmtRpcHandlers:
                 raise ValueError("rpc method is not implemented: %s" % requested_method)
             return handler(params)
 
+    @staticmethod
+    def _mask_account_id(account_id):
+        text = str(account_id or "")
+        if not text:
+            return ""
+        return ("*" * max(0, len(text) - 4)) + text[-4:]
+
+    def _bridge_contract(self, account_id=None):
+        """The handshake facts a client fail-closes on: protocol, account,
+        transport, per-channel support, generation (migration plan 6.2)."""
+        service = getattr(self, "rpc_service", None)
+        status = getattr(service, "contract_status", None)
+        info = status() if callable(status) else {
+            "protocol_version": RPC_PROTOCOL_VERSION,
+            "transport": {"name": "unknown"},
+            "supports": {
+                "rpc": True,
+                "quote": self.quote_subscription_manager is not None,
+                "trade_events": False,
+                "position_events": self.position_sync_sink is not None,
+            },
+            "server_generation": self.server_generation,
+            "server_started_at": self.server_started_at,
+        }
+        info = dict(info)
+        # Never the service's account: a multi-account deployment builds every
+        # secondary service against the SAME handlers and each one overwrites
+        # the rpc_service backref, so the last one built would answer for all.
+        info["account_id_masked"] = self._mask_account_id(
+            account_id or self.account_id)
+        # The client orders its own RPC budget above this one (plan section 8).
+        info["settle_orders_inline"] = bool(self.settle_orders_inline)
+        info["order_settle_timeout_seconds"] = float(
+            self.order_settle_timeout_seconds)
+        return info
+
     def _handle_ping(self, params):
-        return {
+        info = {
             "pong": True,
             "account_id": self.account_id,
             "allow_order_methods": bool(self.allow_order_methods),
@@ -813,6 +858,26 @@ class BigQmtRpcHandlers:
                 params.get("account_id") or self.account_id),
             "server_time": _dt.datetime.now(),
         }
+        info.update(self._bridge_contract(
+            params.get("account_id") or self.account_id))
+        return info
+
+    def _handle_get_bridge_status(self, params):
+        import sys as _sys
+
+        info = self._bridge_contract(
+            params.get("account_id") or self.account_id)
+        info.update({
+            "version": _deployed_version(),
+            "rpc_revision": RPC_REVISION,
+            "python_version": ".".join(
+                str(part) for part in _sys.version_info[:3]),
+            "allow_order_methods": bool(self.allow_order_methods),
+            "account_type": self._reported_account_type(
+                params.get("account_id") or self.account_id),
+            "server_time": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        return info
 
     def _reported_account_types(self, account_id=None):
         try:
@@ -865,6 +930,7 @@ class BigQmtRpcHandlers:
             "python_version": "",
             "rpc_revision": RPC_REVISION,
         }
+        info.update(self._bridge_contract())
         try:
             info["python_version"] = ".".join(
                 str(part) for part in _sys.version_info[:3])
@@ -940,6 +1006,7 @@ class BigQmtRpcHandlers:
             "credit_probe": {},
             "server_time": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
+        info.update(self._bridge_contract())
         for name in self._PROBE_QMT_GLOBALS:
             info["qmt_globals"][name] = callable(self.qmt_api.get(name))
         context_info = getattr(self.market_data, "context_info", None)
@@ -2616,7 +2683,16 @@ class BigQmtRpcHandlers:
         # is at or after it; an entry from an earlier same-remark order is
         # strictly before it (#299).
         submitted_at = time.time()
-        result = self.order_gateway.submit(request)
+        self._order_dispatch_state = "dispatching"
+        try:
+            result = self.order_gateway.submit(request)
+        except Exception:
+            attempted = getattr(
+                self.order_gateway, "_last_submit_attempted", None)
+            self._order_dispatch_state = (
+                "rejected" if attempted is False else "ambiguous")
+            raise
+        self._order_dispatch_state = "submitted"
 
         # 委托后校验：确认委托是否真的进了系统。passorder 调用成功但委托没进
         # 系统时（静默失败），记录 server_error 让客户端知道。匹配严格按
@@ -3132,19 +3208,29 @@ class BigQmtRpcHandlers:
             raise ValueError("order_code is required")
         if volume is None:
             raise ValueError("volume is required")
-        return passthrough(
-            op_type=op_type,
-            order_type=order_type,
-            account_id=account_id,
-            order_code=order_code,
-            price_type=price_type,
-            price=price,
-            volume=volume,
-            strategy_name=strategy_name,
-            quick_trade=quick_trade,
-            user_order_id=user_order_id,
-            dry_run=bool(pick("dry_run", "dryRun", default=False)),
-        )
+        self._order_dispatch_state = "dispatching"
+        try:
+            result = passthrough(
+                op_type=op_type,
+                order_type=order_type,
+                account_id=account_id,
+                order_code=order_code,
+                price_type=price_type,
+                price=price,
+                volume=volume,
+                strategy_name=strategy_name,
+                quick_trade=quick_trade,
+                user_order_id=user_order_id,
+                dry_run=bool(pick("dry_run", "dryRun", default=False)),
+            )
+        except Exception:
+            attempted = getattr(
+                self.order_gateway, "_last_submit_attempted", None)
+            self._order_dispatch_state = (
+                "rejected" if attempted is False else "ambiguous")
+            raise
+        self._order_dispatch_state = "submitted"
+        return result
 
     def _handle_cancel_order(self, params):
         if self.order_gateway is None:
@@ -3157,7 +3243,16 @@ class BigQmtRpcHandlers:
             order_sys_id=order_sys_id,
             user_order_id=str(params.get("user_order_id") or ""),
         )
-        result = self.order_gateway.cancel(order_ref, account_id=account_id)
+        self._order_dispatch_state = "dispatching"
+        try:
+            result = self.order_gateway.cancel(order_ref, account_id=account_id)
+        except Exception:
+            attempted = getattr(
+                self.order_gateway, "_last_cancel_attempted", None)
+            self._order_dispatch_state = (
+                "rejected" if attempted is False else "ambiguous")
+            raise
+        self._order_dispatch_state = "submitted"
 
         # The native cancel return is not trustworthy in EITHER direction.
         # #148: falsey while the broker accepted the cancel (status became 54
@@ -3655,6 +3750,41 @@ class RedisPubSubRpcService:
     def request_queue(self):
         return self.request_queue_template.format(account_id=self.account_id)
 
+    def contract_status(self):
+        transport = self._transport
+        name = str(getattr(transport, "name", "") or
+                   transport.__class__.__name__).lower()
+        masked = BigQmtRpcHandlers._mask_account_id(self.account_id)
+        summary = {"name": name}
+        if name == "redis":
+            try:
+                kwargs = getattr(
+                    getattr(self.listen_redis, "connection_pool", None),
+                    "connection_kwargs", {}) or {}
+                summary["db"] = int(kwargs.get("db", 0))
+            except Exception:
+                summary["db"] = None
+            summary["channels"] = {
+                "request": self.request_channel_template.format(account_id=masked),
+                "queue": self.request_queue_template.format(account_id=masked),
+            }
+        handlers = self.handlers
+        return {
+            "protocol_version": RPC_PROTOCOL_VERSION,
+            "transport": summary,
+            "supports": {
+                "rpc": True,
+                "quote": handlers.quote_subscription_manager is not None,
+                "trade_events": True,
+                "position_events": handlers.position_sync_sink is not None,
+            },
+            # Generation belongs to the handlers, not to this service: one
+            # multi-account deployment runs several services over a single set
+            # of handlers and restarts them together.
+            "server_generation": getattr(handlers, "server_generation", ""),
+            "server_started_at": getattr(handlers, "server_started_at", ""),
+        }
+
     def start(self):
         self._running.set()
         # Delegate thread lifecycle to the transport. The transport invokes the
@@ -4013,8 +4143,13 @@ class RedisPubSubRpcService:
                 else:
                     done = self.handlers._apply_order_lookup(
                         settlement, final=expired, orders_cache=orders_cache)
-            except Exception:
+            except Exception as exc:
                 done = True  # never strand a submitted order in the queue
+                if hasattr(settlement, "server_error"):
+                    settlement.server_error = (
+                        "post-submit reconciliation failed; the order outcome "
+                        "is ambiguous: %s: %s" %
+                        (exc.__class__.__name__, exc))
             if not done:
                 self._pending_settlements.put(settlement)
                 continue
@@ -4024,6 +4159,27 @@ class RedisPubSubRpcService:
             if getattr(settlement, "server_error", ""):
                 response["server_error"] = settlement.server_error
             response["handled_at"] = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            response["_t_reply"] = time.time()
+            if (settlement.request or {}).get("client_request_id"):
+                outcome = "ambiguous" if response.get("server_error") else "accepted"
+                response["order_outcome"] = outcome
+                if outcome == "ambiguous":
+                    response["error_code"] = "ORDER_OUTCOME_AMBIGUOUS"
+                try:
+                    self._remember_durable_order_response(
+                        settlement.request, response, outcome)
+                except Exception as exc:
+                    response["order_outcome"] = "ambiguous"
+                    response["error_code"] = "IDEMPOTENCY_RESULT_NOT_PERSISTED"
+                    response["server_error"] = (
+                        "order result could not be persisted: %s: %s" %
+                        (exc.__class__.__name__, exc))
+            order_key = (
+                str((settlement.request or {}).get("account_id") or self.account_id or ""),
+                str((settlement.request or {}).get("request_id") or ""),
+            )
+            if order_key[1]:
+                self._remember_order_response(order_key, response)
             try:
                 request = settlement.request or {}
                 self._remember_order_response(
@@ -4150,6 +4306,8 @@ class RedisPubSubRpcService:
 
     ORDER_DEDUP_MAX = 512
     ORDER_DEDUP_TTL_SECONDS = 600
+    ORDER_IDEMPOTENCY_MAX_PER_DAY = 20000
+    ORDER_IDEMPOTENCY_TTL_SECONDS = 32 * 86400
 
     def _canonical(self, method):
         resolve = getattr(self.handlers, "_canonical_method", None)
@@ -4270,11 +4428,123 @@ class RedisPubSubRpcService:
         return {"request_id": request_id, "state": entry.get("state") or "dispatching",
                 "response": entry.get("response")}
 
+    @staticmethod
+    def _trading_day():
+        return _dt.datetime.now().strftime("%Y%m%d")
+
+    def _order_body_digest(self, account_id, method, params):
+        body = {
+            "account_id": str(account_id or ""),
+            "method": str(self._canonical(method) or ""),
+            "params": to_jsonable(params or {}),
+        }
+        raw = json.dumps(
+            body, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), default=str)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _idempotency_keys(self, account_id, client_request_id, trading_day):
+        account_hash = hashlib.sha256(
+            str(account_id or "").encode("utf-8")).hexdigest()[:16]
+        request_hash = hashlib.sha256(
+            str(client_request_id).encode("utf-8")).hexdigest()
+        daily_key = "bigqmt:order_idempotency:%s:%s" % (
+            account_hash, trading_day)
+        marker_key = "bigqmt:order_idempotency_day:%s:%s" % (
+            account_hash, request_hash)
+        return daily_key, marker_key, request_hash
+
+    def _claim_durable_order_request(
+            self, account_id, client_request_id, method, params):
+        client_request_id = str(client_request_id or "").strip()
+        if not client_request_id:
+            raise ValueError("client_request_id must not be empty")
+        if len(client_request_id) > 128:
+            raise ValueError("client_request_id exceeds 128 characters")
+        redis_client = getattr(self, "redis", None)
+        required = ("get", "set", "hget", "hset", "hsetnx", "hlen", "expire")
+        if redis_client is None or not all(
+                callable(getattr(redis_client, name, None)) for name in required):
+            raise RuntimeError("durable idempotency store is unavailable")
+
+        trading_day = self._trading_day()
+        digest = self._order_body_digest(account_id, method, params)
+        daily_key, marker_key, field = self._idempotency_keys(
+            account_id, client_request_id, trading_day)
+        marker = redis_client.get(marker_key)
+        marker = decode_text(marker) if marker is not None else ""
+        if not marker:
+            claimed_marker = redis_client.set(
+                marker_key, trading_day, nx=True,
+                ex=self.ORDER_IDEMPOTENCY_TTL_SECONDS)
+            if not claimed_marker:
+                marker = decode_text(redis_client.get(marker_key) or "")
+            else:
+                marker = trading_day
+        if marker and marker != trading_day:
+            return "cross_day", {
+                "client_request_id": client_request_id,
+                "trading_day": marker,
+                "body_digest": digest,
+            }
+
+        raw = redis_client.hget(daily_key, field)
+        if raw is not None:
+            record = json.loads(decode_text(raw))
+            if str(record.get("body_digest") or "") != digest:
+                return "conflict", record
+            return "existing", record
+        if int(redis_client.hlen(daily_key) or 0) >= self.ORDER_IDEMPOTENCY_MAX_PER_DAY:
+            raise RuntimeError(
+                "daily idempotency record limit reached (%d)" %
+                self.ORDER_IDEMPOTENCY_MAX_PER_DAY)
+        now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        record = {
+            "client_request_id": client_request_id,
+            "trading_day": trading_day,
+            "body_digest": digest,
+            "state": "processing",
+            "created_at": now,
+            "updated_at": now,
+            "response": None,
+        }
+        encoded = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        if not redis_client.hsetnx(daily_key, field, encoded):
+            record = json.loads(decode_text(redis_client.hget(daily_key, field)))
+            if str(record.get("body_digest") or "") != digest:
+                return "conflict", record
+            return "existing", record
+        redis_client.expire(daily_key, self.ORDER_IDEMPOTENCY_TTL_SECONDS)
+        return "claimed", record
+
+    def _remember_durable_order_response(self, request, response, state):
+        client_request_id = str(
+            (request or {}).get("client_request_id") or "").strip()
+        if not client_request_id:
+            return True
+        account_id = str((request or {}).get("account_id") or self.account_id or "")
+        day = self._trading_day()
+        daily_key, _marker_key, field = self._idempotency_keys(
+            account_id, client_request_id, day)
+        raw = self.redis.hget(daily_key, field)
+        if raw is None:
+            raise RuntimeError("durable idempotency claim disappeared")
+        record = json.loads(decode_text(raw))
+        record["state"] = str(state)
+        record["updated_at"] = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        record["response"] = to_jsonable(response)
+        self.redis.hset(
+            daily_key, field,
+            json.dumps(record, ensure_ascii=False, sort_keys=True))
+        self.redis.expire(daily_key, self.ORDER_IDEMPOTENCY_TTL_SECONDS)
+        return True
+
     def process_request(self, request):
         request = dict(request or {})
         request_id = str(request.get("request_id") or request.get("id") or uuid.uuid4().hex)
         account_id = str(request.get("account_id") or self.account_id or "")
         method = str(request.get("method") or "")
+        canonical_order_method = self._canonical(method) in ORDER_METHODS
 
         # At-most-once for writes (#245). The client's redis-py connection
         # retries transparently on ConnectionError/TimeoutError, and the retry
@@ -4291,7 +4561,7 @@ class RedisPubSubRpcService:
         # both copies name the same reply key, so it lands where the client is
         # already waiting.
         order_key = None
-        if request_id and self._canonical(method) in ORDER_METHODS:
+        if request_id and canonical_order_method:
             order_key = (account_id, request_id)
             seen = self._claim_order_request(order_key)
             if seen is not None:
@@ -4328,10 +4598,85 @@ class RedisPubSubRpcService:
             # return without guessing (#104).
             "_t_recv": time.time(),
         }
+        durable_claimed = False
+        if canonical_order_method and "client_request_id" in request:
+            client_request_id = str(request.get("client_request_id") or "").strip()
+            response["client_request_id"] = client_request_id
+            try:
+                claim_status, record = self._claim_durable_order_request(
+                    account_id, client_request_id, method,
+                    request.get("params") or {})
+                response["body_digest"] = record.get("body_digest") or ""
+            except Exception as exc:
+                claim_status, record = "store_error", {}
+                response["order_outcome"] = "rejected"
+                response["error_code"] = "IDEMPOTENCY_STORE_UNAVAILABLE"
+                response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+            if claim_status == "claimed":
+                durable_claimed = True
+                response["order_outcome"] = "processing"
+                response["idempotency_replayed"] = False
+            elif claim_status == "existing":
+                remembered = record.get("response")
+                if remembered is not None and record.get("state") != "processing":
+                    replay = dict(remembered)
+                    replay["request_id"] = request_id
+                    replay["account_id"] = account_id
+                    replay["method"] = method
+                    replay["client_request_id"] = client_request_id
+                    replay["idempotency_replayed"] = True
+                    try:
+                        self._publish_response(request, replay)
+                    except Exception:
+                        pass
+                    if order_key is not None:
+                        self._remember_order_response(
+                            order_key, replay, state="settled")
+                    return replay
+                response["order_outcome"] = "ambiguous"
+                response["error_code"] = "ORDER_OUTCOME_AMBIGUOUS"
+                response["error"] = (
+                    "client_request_id is already processing; the prior "
+                    "request may have reached passorder")
+            elif claim_status == "conflict":
+                response["order_outcome"] = "conflict"
+                response["error_code"] = "CLIENT_REQUEST_ID_CONFLICT"
+                response["error"] = (
+                    "client_request_id was already used with a different "
+                    "request body")
+            elif claim_status == "cross_day":
+                response["order_outcome"] = "conflict"
+                response["error_code"] = "CLIENT_REQUEST_ID_CROSS_DAY"
+                response["error"] = (
+                    "client_request_id was already used on trading day %s" %
+                    record.get("trading_day"))
+            if not durable_claimed:
+                response["_t_reply"] = time.time()
+                try:
+                    self._publish_response(request, response)
+                except Exception:
+                    pass
+                if order_key is not None:
+                    self._remember_order_response(
+                        order_key, response, state="settled")
+                return response
+        # After the durable lookup, so a resend of an already-placed
+        # client_request_id replays that result instead of reading "rejected".
         waited = self._expired_before_dispatch(request, method)
         if waited is not None:
+            if durable_claimed:
+                # Refused before passorder: provably nothing was placed.
+                response["order_outcome"] = "rejected"
+                response["error_code"] = "ORDER_REJECTED_BEFORE_DISPATCH"
+                try:
+                    self._remember_durable_order_response(
+                        request, response, "rejected")
+                except Exception:
+                    pass  # record stays "processing": replays answer ambiguous
             return self._refuse_expired(request, response, method, waited, order_key)
         try:
+            if canonical_order_method:
+                self.handlers._order_dispatch_state = "pre_dispatch"
             if self.account_id and account_id and account_id != self.account_id:
                 raise PermissionError("account_id mismatch")
             _t0 = time.perf_counter()
@@ -4349,6 +4694,11 @@ class RedisPubSubRpcService:
             server_error = getattr(self.handlers, "_last_server_error", None)
             if server_error:
                 response["server_error"] = str(server_error)
+            if durable_claimed:
+                response["order_outcome"] = (
+                    "ambiguous" if response["server_error"] else "accepted")
+                if response["server_error"]:
+                    response["error_code"] = "ORDER_OUTCOME_AMBIGUOUS"
             # passorder may still be awaiting its asynchronously assigned id;
             # a falsey native cancel may still be awaiting a reliable terminal
             # status (#148). Park either reply instead of sleeping on this
@@ -4365,11 +4715,35 @@ class RedisPubSubRpcService:
                 self._pending_settlements.put(settlement)
                 self._deferred_count += 1
                 if order_key is not None:
-                    self._remember_order_response(order_key, response, state="dispatched")
+                    # A durable claim keeps no reply until settled: a duplicate
+                    # copy would otherwise be answered the "processing" interim.
+                    self._remember_order_response(
+                        order_key, None if durable_claimed else response,
+                        state="dispatched")
                 return response
         except Exception as exc:
             response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+            if durable_claimed:
+                dispatch_state = str(getattr(
+                    self.handlers, "_order_dispatch_state", "pre_dispatch"))
+                if dispatch_state in ("dispatching", "submitted", "ambiguous"):
+                    response["order_outcome"] = "ambiguous"
+                    response["error_code"] = "ORDER_OUTCOME_AMBIGUOUS"
+                else:
+                    response["order_outcome"] = "rejected"
+                    response["error_code"] = "ORDER_REJECTED_BEFORE_DISPATCH"
         response["_t_reply"] = time.time()
+        if durable_claimed:
+            outcome = response.get("order_outcome") or "rejected"
+            try:
+                self._remember_durable_order_response(
+                    request, response, outcome)
+            except Exception as exc:
+                response["order_outcome"] = "ambiguous"
+                response["error_code"] = "IDEMPOTENCY_RESULT_NOT_PERSISTED"
+                response["server_error"] = (
+                    "order result could not be persisted: %s: %s" %
+                    (exc.__class__.__name__, exc))
         if order_key is not None:
             self._remember_order_response(order_key, response, state="settled")
         _t_pub0 = time.perf_counter() if method == "ping" else 0.0
@@ -4521,6 +4895,7 @@ def call_redis_rpc(
     ttl_seconds=60,
     transport="queue",
     request_id=None,
+    client_request_id=None,
 ):
     """Small external client helper for tests and admin scripts."""
 
@@ -4544,6 +4919,8 @@ def call_redis_rpc(
         # an order it only gets to after that (#303).
         "timeout_seconds": float(timeout_seconds),
     }
+    if client_request_id is not None:
+        request["client_request_id"] = str(client_request_id)
     payload = encode_rpc_request_payload(request)
     if str(transport or "queue").lower() in ("queue", "list", "blpop"):
         redis_client.rpush(request_queue, payload)

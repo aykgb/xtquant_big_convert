@@ -33,7 +33,13 @@ from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
 from .order_id import OrderId, order_sys_id_of
 from .option_order_type import option_order_type
-from .redis_rpc import TYPED_PAYLOAD_FLAG, call_redis_rpc
+from .redis_rpc import (
+    METHOD_ALIASES,
+    ORDER_METHODS,
+    RPC_PROTOCOL_VERSION,
+    TYPED_PAYLOAD_FLAG,
+    call_redis_rpc,
+)
 from .logging_setup import get_logger
 
 log = get_logger("xtquant_compat")
@@ -1360,6 +1366,166 @@ class BigQmtRpcClient:
             formula_config["enabled"] = _env_bool("BIGQMT_FORMULA_ENABLED", True)
         self.formula_server_config = formula_config
         self._formula_router_instance = None  # lazily built by _formula_router()
+        self._health_lock = threading.RLock()
+        self._health_stop = threading.Event()
+        self._health_thread = None
+        self._rpc_ready = False
+        self._rpc_generation = 0
+        self._last_rpc_success_at = 0.0
+        self._last_rpc_failure_at = 0.0
+        self._last_rpc_latency_ms = None
+        self._last_rpc_error = ""
+        self._handshake = {}
+        self.health_interval_seconds = max(
+            0.2, _env_float("BIGQMT_HEALTH_INTERVAL_SECONDS", 3.0))
+        self.health_stale_after_seconds = max(
+            self.health_interval_seconds * 3.0,
+            _env_float("BIGQMT_HEALTH_STALE_AFTER_SECONDS", 10.0))
+
+    @staticmethod
+    def _masked_account_id(account_id):
+        text = str(account_id or "")
+        if not text:
+            return ""
+        return ("*" * max(0, len(text) - 4)) + text[-4:]
+
+    @staticmethod
+    def _major_minor(version):
+        parts = str(version or "").split(".")
+        return tuple(parts[:2]) if len(parts) >= 2 else ()
+
+    def validate_handshake(self, info):
+        info = dict(info or {})
+        from .version import __version__ as local_version
+
+        server_version = str(info.get("version") or "")
+        if self._major_minor(server_version) != self._major_minor(local_version):
+            raise RpcCompatibilityError(
+                "bridge major/minor version mismatch: client=%s server=%s" %
+                (local_version, server_version or "missing"))
+        protocol = str(info.get("protocol_version") or "")
+        if protocol != RPC_PROTOCOL_VERSION:
+            raise RpcCompatibilityError(
+                "bridge protocol mismatch: client=%s server=%s" %
+                (RPC_PROTOCOL_VERSION, protocol or "missing"))
+        expected_account = self._masked_account_id(self.account_id)
+        server_account = str(info.get("account_id_masked") or "")
+        if not server_account:
+            server_account = self._masked_account_id(info.get("account_id"))
+        if not server_account or server_account != expected_account:
+            raise RpcCompatibilityError(
+                "bridge account mismatch: client=%s server=%s" %
+                (expected_account, server_account or "missing"))
+        if not str(info.get("server_generation") or ""):
+            raise RpcCompatibilityError("bridge server_generation is missing")
+        supports = dict(info.get("supports") or {})
+        if supports.get("rpc") is not True:
+            raise RpcCompatibilityError("bridge does not report RPC support")
+        return info
+
+    def handshake(self):
+        started = time.perf_counter()
+        try:
+            info = self.call(
+                "ping", {}, timeout_seconds=self.timeout_seconds,
+                use_formula=False)
+            info = self.validate_handshake(info)
+        except Exception as exc:
+            with self._health_lock:
+                self._rpc_ready = False
+                self._last_rpc_failure_at = time.time()
+                self._last_rpc_error = "%s: %s" % (
+                    exc.__class__.__name__, exc)
+            raise
+        latency = (time.perf_counter() - started) * 1000.0
+        with self._health_lock:
+            previous = str(self._handshake.get("server_generation") or "")
+            current = str(info.get("server_generation") or "")
+            if not self._rpc_ready or current != previous:
+                self._rpc_generation += 1
+            self._rpc_ready = True
+            self._last_rpc_success_at = time.time()
+            self._last_rpc_latency_ms = latency
+            self._last_rpc_error = ""
+            self._handshake = dict(info)
+        return info
+
+    def start_health_monitor(self, initial_probe=True):
+        thread = self._health_thread
+        if thread is not None and thread.is_alive():
+            return self.get_status()
+        self._health_stop.clear()
+        if initial_probe:
+            self.handshake()
+        self._health_thread = threading.Thread(
+            target=self._health_loop, name="bigqmt-rpc-health", daemon=True)
+        self._health_thread.start()
+        return self.get_status()
+
+    def _health_loop(self):
+        while not self._health_stop.wait(self.health_interval_seconds):
+            try:
+                self.handshake()
+            except Exception:
+                pass
+
+    def get_status(self, refresh=False):
+        if refresh:
+            try:
+                self.handshake()
+            except Exception:
+                pass
+        with self._health_lock:
+            status = {
+                "rpc_ready": bool(self._rpc_ready),
+                "rpc_generation": self._rpc_generation,
+                "last_rpc_success_at": self._last_rpc_success_at or None,
+                "last_rpc_failure_at": self._last_rpc_failure_at or None,
+                "last_rpc_latency_ms": self._last_rpc_latency_ms,
+                "last_rpc_error": self._last_rpc_error,
+                "handshake": dict(self._handshake),
+            }
+        if status["rpc_ready"] and status["last_rpc_success_at"]:
+            age = time.time() - status["last_rpc_success_at"]
+            status["rpc_ready"] = age <= self.health_stale_after_seconds
+            status["rpc_age_seconds"] = max(0.0, age)
+        else:
+            status["rpc_age_seconds"] = None
+        status["health_monitor_running"] = bool(
+            self._health_thread is not None and self._health_thread.is_alive())
+        return status
+
+    def stop(self):
+        self._health_stop.set()
+        thread = self._health_thread
+        if (thread is not None and thread.is_alive()
+                and thread is not threading.current_thread()):
+            thread.join(timeout=1.0)
+        self._health_thread = None
+        for name in ("_rpc_async_pool", "_rpc_async_dispatcher"):
+            pool = getattr(self, name, None)
+            if pool is not None:
+                try:
+                    pool.shutdown(wait=False)
+                except Exception:
+                    pass
+                setattr(self, name, None)
+        for obj in (self._formula_router_instance, self._transport_instance):
+            close = getattr(obj, "close", None) or getattr(obj, "stop", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+        close = getattr(self.redis_client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        with self._health_lock:
+            self._rpc_ready = False
+        return 0
 
     def _redis(self):
         if self.redis_client is None:
@@ -1432,14 +1598,17 @@ class BigQmtRpcClient:
         return self._formula_router_instance
 
     def call_tracked(self, method, params=None, account_id=None, request_id=None,
-                     timeout_seconds=None):
+                     timeout_seconds=None, client_request_id=None):
         """``call`` under a request_id the caller chose, so it can ask the
         server what became of the request after a timeout (#303)."""
         return self.call(method, params, account_id=account_id,
-                         timeout_seconds=timeout_seconds, request_id=request_id)
+                         timeout_seconds=timeout_seconds, request_id=request_id,
+                         client_request_id=client_request_id)
 
-    def call(self, method, params=None, account_id=None, timeout_seconds=None, use_formula=True,
-             request_id=None):
+    def call(
+        self, method, params=None, account_id=None, timeout_seconds=None,
+        use_formula=True, request_id=None, client_request_id=None,
+    ):
         target_account = str(account_id or self.account_id or "")
         if not target_account:
             raise ValueError(_missing_account_id_message())
@@ -1472,8 +1641,10 @@ class BigQmtRpcClient:
                     if hit is not None:
                         _warn_stale_formula_bars(result, params or {}, hit=hit)
                         _formula_stale_until["ts"] = time.time() + _FORMULA_STALE_COOLDOWN_SECONDS
-                        return self.call(method, params, account_id=account_id,
-                                         timeout_seconds=timeout_seconds, use_formula=False)
+                        return self.call(
+                            method, params, account_id=account_id,
+                            timeout_seconds=timeout_seconds, use_formula=False,
+                            client_request_id=client_request_id)
                 return result
             except Unroutable:
                 pass
@@ -1492,16 +1663,30 @@ class BigQmtRpcClient:
                 # after that refuses it instead of running it (#303).
                 "timeout_seconds": float(wait_seconds),
             }
-            response = transport.send_request(request, wait_seconds)
+            if client_request_id is not None:
+                request["client_request_id"] = str(client_request_id)
+            try:
+                response = transport.send_request(request, wait_seconds)
+            except TimeoutError as exc:
+                self._raise_ambiguous_timeout(
+                    method, client_request_id, target_account, exc, request_id)
+                raise
         else:
-            response = call_redis_rpc(
-                self._redis(),
-                account_id=target_account,
-                method=method,
-                params=params or {},
-                timeout_seconds=wait_seconds,
-                request_id=request_id,
-            )
+            try:
+                response = call_redis_rpc(
+                    self._redis(),
+                    account_id=target_account,
+                    method=method,
+                    params=params or {},
+                    timeout_seconds=wait_seconds,
+                    request_id=request_id,
+                    client_request_id=client_request_id,
+                )
+            except TimeoutError as exc:
+                self._raise_ambiguous_timeout(
+                    method, client_request_id, target_account, exc, request_id)
+                raise
+        _raise_for_order_outcome(response)
         if not response.get("ok"):
             raise RpcServerRepliedError(
                 response.get("error") or "Big QMT RPC failed: %s" % method)
@@ -1519,6 +1704,24 @@ class BigQmtRpcClient:
         if response.pop(TYPED_PAYLOAD_FLAG, None) is False:
             return response.get("data")
         return _restore_jsonable(response.get("data"))
+
+    @staticmethod
+    def _raise_ambiguous_timeout(method, client_request_id, account_id, exc,
+                                 request_id=None):
+        canonical = METHOD_ALIASES.get(str(method), str(method))
+        if client_request_id is None or canonical not in ORDER_METHODS:
+            return
+        if request_id is not None:
+            return  # a tracked caller asks get_request_outcome first (#303)
+        raise RpcOrderAmbiguousError({
+            "ok": False,
+            "method": str(method),
+            "account_id": str(account_id),
+            "client_request_id": str(client_request_id),
+            "order_outcome": "ambiguous",
+            "error_code": "ORDER_RPC_TIMEOUT",
+            "error": str(exc),
+        })
 
     # ------------------------------------------------------------------
     # Async RPC (issue #63): call_async returns a Future immediately, so a
@@ -1539,7 +1742,10 @@ class BigQmtRpcClient:
             self._rpc_async_dispatcher = None
         return pool
 
-    def call_async(self, method, params=None, account_id=None, timeout_seconds=None, callback=None):
+    def call_async(
+        self, method, params=None, account_id=None, timeout_seconds=None,
+        callback=None, client_request_id=None,
+    ):
         """Submit an RPC without blocking; returns concurrent.futures.Future.
 
         ``callback`` (optional) receives the result on a single dispatcher
@@ -1555,8 +1761,10 @@ class BigQmtRpcClient:
 
         def _run():
             try:
-                return self.call(method, params, account_id=account_id,
-                                 timeout_seconds=timeout_seconds)
+                return self.call(
+                    method, params, account_id=account_id,
+                    timeout_seconds=timeout_seconds,
+                    client_request_id=client_request_id)
             finally:
                 self._rpc_async_slots.release()
 
@@ -1611,6 +1819,25 @@ class BigQmtRpcClient:
         except Exception:
             pass
         return event
+
+    def read_event_streams(self, cursors=None, count=500, block_ms=None):
+        from .exec_events import read_exec_event_streams
+
+        return read_exec_event_streams(
+            self._redis(), self.account_id, cursors=cursors,
+            count=count, block_ms=block_ms)
+
+    def load_event_cursors(self, consumer_id):
+        from .exec_events import load_exec_cursors
+
+        return load_exec_cursors(
+            self._redis(), self.account_id, consumer_id)
+
+    def persist_event_cursors(self, consumer_id, cursors):
+        from .exec_events import persist_exec_cursors
+
+        return persist_exec_cursors(
+            self._redis(), self.account_id, consumer_id, cursors)
 
     def save_quote_subscription(self, seq, payload, active=True):
         # MySQL、SHM 和混合 ZMQ 继续保留既有 Redis subscription metadata 行为。
@@ -1692,6 +1919,45 @@ class RpcServerRepliedError(RuntimeError):
     before its per-item loop, so a replied error means no item ran and a retry
     is safe. A timeout means the batch may still be running and retrying
     doubles orders."""
+
+
+class RpcCompatibilityError(RpcServerRepliedError):
+    """The bridge handshake is incompatible with this client."""
+
+
+class RpcOrderOutcomeError(RpcServerRepliedError):
+    """Typed server result for a write protected by client_request_id."""
+
+    def __init__(self, response):
+        self.response = dict(response or {})
+        message = (
+            self.response.get("error")
+            or self.response.get("server_error")
+            or self.response.get("error_code")
+            or "Big QMT order request failed")
+        super(RpcOrderOutcomeError, self).__init__(str(message))
+
+
+class RpcOrderRejectedError(RpcOrderOutcomeError):
+    """The request definitely failed before a native write was dispatched."""
+
+
+class RpcOrderAmbiguousError(RpcOrderOutcomeError):
+    """A native write may have been dispatched; callers must not auto-retry."""
+
+
+class RpcOrderConflictError(RpcOrderOutcomeError):
+    """The client_request_id was reused for a different body or trading day."""
+
+
+def _raise_for_order_outcome(response):
+    outcome = str((response or {}).get("order_outcome") or "")
+    if outcome == "conflict":
+        raise RpcOrderConflictError(response)
+    if outcome == "ambiguous":
+        raise RpcOrderAmbiguousError(response)
+    if outcome == "rejected":
+        raise RpcOrderRejectedError(response)
 
 
 
@@ -1972,6 +2238,20 @@ def warn_on_version_mismatch(ping_response):
         return None
 
 
+def _client_channel_status(client, refresh=False):
+    """Per-channel health of a client that may be a stand-in without one."""
+    getter = getattr(client, "get_status", None)
+    if callable(getter):
+        return dict(getter(refresh=refresh))
+    return {
+        "rpc_ready": False,
+        "rpc_generation": 0,
+        "handshake": {},
+        "health_monitor_running": False,
+        "last_rpc_error": "client has no health API",
+    }
+
+
 def auto_sync_enabled():
     """Writing into a live trading terminal is opt-in, not a side effect of
     connecting."""
@@ -1987,6 +2267,7 @@ class BigQmtXtData:
         self._quote_session_factory = None  # test hook: returns a session-like object
         self._bar_pollers = {}              # seq -> _BarPoller, for K-line periods
         self._bar_poller_lock = threading.Lock()
+        self._run_stop = threading.Event()
 
     def _next_seq(self):
         self._subscribe_seq += 1
@@ -3065,6 +3346,7 @@ class BigQmtXtData:
         only exposes ContextInfo.subscribe_whole_quote, which carries ticks --
         so they are polled and emitted when the newest bar changes.
         """
+        self._run_stop.clear()
         payload = {
             "stock_code": stock_code,
             "period": period,
@@ -3203,6 +3485,7 @@ class BigQmtXtData:
     _SUBSCRIBE_PRIME_MAX_CODES = 100
 
     def subscribe_whole_quote(self, code_list, callback=None):
+        self._run_stop.clear()
         session = self._whole_quote_session()
         session.start()
         sub_id = session.subscribe_whole_quote(code_list, callback=callback)
@@ -3325,19 +3608,83 @@ class BigQmtXtData:
         return 0
 
     def stop_all_subscriptions(self):
-        """Stop every K-line poller this object owns. Daemon threads die with
-        the process anyway; this is for tests and for callers that recycle a
-        client without exiting."""
+        """Stop every K-line and whole-quote subscription this object owns."""
         with self._bar_poller_lock:
             pollers = list(self._bar_pollers.values())
             self._bar_pollers.clear()
         for poller in pollers:
             poller.stop()
-        return len(pollers)
+        quote_count = 0
+        session = self._quote_session
+        if session is not None:
+            status = getattr(session, "status", lambda: {})()
+            quote_count = int(status.get("subscriptions") or 0)
+            session.stop()
+        return len(pollers) + quote_count
+
+    def get_status(self, refresh=False):
+        rpc = _client_channel_status(self.client, refresh=refresh)
+        session = self._quote_session
+        if session is not None and callable(getattr(session, "status", None)):
+            quote = session.status()
+        else:
+            with self._bar_poller_lock:
+                poller_count = len(self._bar_pollers)
+            quote = {
+                "quote_ready": bool(poller_count and rpc.get("rpc_ready")),
+                "generation": 0,
+                "subscriptions": poller_count,
+                "subscriber_active": bool(poller_count),
+                "heartbeat_running": False,
+            }
+        router = getattr(self.client, "_formula_router_instance", None)
+        formula = (
+            router.stats() if callable(getattr(router, "stats", None))
+            else {"enabled": bool(getattr(
+                      self.client, "formula_server_config", {}).get("enabled")),
+                  "hits": 0, "misses": 0, "available": None})
+        cache = self._cache_obj
+        local_cache = (
+            cache.health_stats()
+            if callable(getattr(cache, "health_stats", None))
+            else {"files": 0, "periods": [], "read_hits": 0,
+                  "read_misses": 0, "hit_rate": None})
+        status = dict(rpc)
+        status.update({
+            "quote_ready": bool(quote.get("quote_ready")),
+            "quote_generation": int(quote.get("generation") or 0),
+            "quote": quote,
+            "formula_server": formula,
+            "local_cache": local_cache,
+            "quote_degraded": bool(
+                formula.get("enabled") and formula.get("available") is False),
+        })
+        return status
+
+    def stop(self):
+        """Stop this object's market-data work: run loop and subscriptions.
+
+        Deliberately does NOT tear down the RPC client. ``configure()`` hands
+        the same BigQmtRpcClient to xtdata and to xt_trader, so closing it here
+        would pull Redis out from under the trading session that is still
+        unsubscribing and stopping after us. The client's own ``stop()`` is the
+        process-level shutdown entry.
+        """
+        self._run_stop.set()
+        self.stop_all_subscriptions()
+        return 0
+
+    def start_health_monitor(self, initial_probe=True):  # noqa: D401
+        """Expose the client's channel-health loop on the xtdata surface.
+
+        A data-service process holds no trader, so without this there is
+        nothing to keep rpc_ready fresh and get_status() answers stale.
+        """
+        return self.client.start_health_monitor(initial_probe=initial_probe)
 
     def run(self):
-        while True:
-            time.sleep(3600)
+        while not self._run_stop.wait(60.0):
+            pass
 
     def get_divid_factors(self, stock_code, start_time="", end_time=""):
         """除权除息因子，返回 DataFrame，对齐 ``xtdata.get_divid_factors``。
@@ -4233,6 +4580,22 @@ class BigQmtXtTrader:
         # on it instead of sleeping blind. Never cleared on reconnect rounds --
         # start() only waits once, and a resubscribe does not un-start it.
         self._event_ready = threading.Event()
+        self._trade_events_ready = False
+        self._trade_events_generation = 0
+        self._last_trade_event_at = 0.0
+        self._last_event_error = ""
+        self._event_consumer_id = str(
+            os.environ.get("BIGQMT_EXEC_EVENT_CONSUMER_ID")
+            or ("xttrader:%s" % _quote_client_id()))
+        self._event_cursor_account = ""
+        self._event_cursors = {}
+        self._event_reconciliation_required = False
+        self._last_event_reconciliation = {}
+        self._event_reconcile_min_interval = max(
+            0.0, _env_float("BIGQMT_EVENT_RECONCILE_MIN_INTERVAL", 5.0))
+        self._position_ready = False
+        self._position_generation = 0
+        self._last_position_sync_at = 0.0
         try:
             self.event_listener_ready_timeout = float(
                 os.environ.get("BIGQMT_EVENT_READY_TIMEOUT") or 1.0)
@@ -4362,11 +4725,42 @@ class BigQmtXtTrader:
     def connect(self):
         try:
             if self.client.account_id:
-                pong = self.client.call("ping")
-                self._note_server_account_type(pong)
-                mismatch = warn_on_version_mismatch(pong)
+                # A client stand-in (tests, embedders) may implement call() and
+                # nothing else. The handshake checks belong to the real client, so
+                # degrade to a plain ping instead of demanding the method exist.
+                handshake = getattr(self.client, "handshake", None)
+                info = handshake() if callable(handshake) else self.client.call("ping")
+                self._note_server_account_type(info)
+                mismatch = warn_on_version_mismatch(info)
                 if mismatch and auto_sync_enabled():
                     self.sync_deployment()
+                start_monitor = getattr(self.client, "start_health_monitor", None)
+                if callable(start_monitor):
+                    start_monitor(initial_probe=False)
+                # A fresh connection is a fresh position generation: whatever the
+                # consumer believed about holdings predates this link.
+                self._position_ready = False
+                try:
+                    self.client.call(
+                        "query_stock_positions",
+                        {"account_id": self.client.account_id},
+                        account_id=self.client.account_id,
+                        use_formula=False)
+                    self._note_position_status(True)
+                except Exception as exc:
+                    self._note_position_status(False)
+                    self._last_event_error = "%s: %s" % (
+                        exc.__class__.__name__, exc)
+                if self._event_reconciliation_required:
+                    redis_client = self._exec_events_redis_or_none()
+                    if redis_client is not None:
+                        try:
+                            self._replay_event_streams(
+                                redis_client, str(self.client.account_id))
+                        except Exception as exc:
+                            self._trade_events_ready = False
+                            self._last_event_error = "%s: %s" % (
+                                exc.__class__.__name__, exc)
             self._fire_account_status()
             return 0
         except Exception:
@@ -4374,8 +4768,9 @@ class BigQmtXtTrader:
             # Redis pubsub 订阅(每实例 4 个 exec 事件频道)随丢弃的实例永久
             # 留在服务端: 调用方重连风暴每次重试泄漏一个, 实测单日 8000+ 个
             # subscribe 连接, 逼近 maxclients 后整个 Redis 拒绝新连接。
+            # 不关 client: configure() 把它同时交给了 xtdata。
             try:
-                self.stop()
+                self._stop_own()
             except Exception:
                 log.exception("connect failed and event listener teardown failed")
             raise
@@ -4452,6 +4847,11 @@ class BigQmtXtTrader:
         return self._event_ready.wait(timeout)
 
     def stop(self):
+        self._stop_own()
+        self.client.stop()
+        return 0
+
+    def _stop_own(self):
         # Drain first: orders already queued must go out before teardown.
         # Costs nothing when the queue is empty (issue #156).
         self._drain_async_orders_on_exit()
@@ -4460,7 +4860,26 @@ class BigQmtXtTrader:
         if thread is not None and thread.is_alive():
             thread.join(1.0)
         self._event_thread = None
-        return 0
+        self._trade_events_ready = False
+        self._position_ready = False
+
+    def get_status(self, refresh=False):
+        status = _client_channel_status(self.client, refresh=refresh)
+        status.update({
+            "trade_events_ready": bool(self._trade_events_ready),
+            "trade_events_generation": self._trade_events_generation,
+            "last_trade_event_at": self._last_trade_event_at or None,
+            "last_event_error": self._last_event_error,
+            "event_cursors": dict(self._event_cursors),
+            "event_reconciliation_required": bool(
+                self._event_reconciliation_required),
+            "last_event_reconciliation": dict(
+                self._last_event_reconciliation),
+            "position_ready": bool(self._position_ready),
+            "position_generation": self._position_generation,
+            "last_position_sync_at": self._last_position_sync_at or None,
+        })
+        return status
 
     def _start_event_listener(self):
         if self._event_thread is not None and self._event_thread.is_alive():
@@ -4516,7 +4935,7 @@ class BigQmtXtTrader:
         """
         callback = self.callback
         if callback is None:
-            return
+            return False
         try:
             callback.on_account_status(
                 CompatObject(
@@ -4546,12 +4965,16 @@ class BigQmtXtTrader:
         try:
             channel = self._build_quote_push_channel()
             channel.start_subscriber(topics, self._on_push_exec_event)
+            self._trade_events_ready = False
+            self._last_event_error = (
+                "push transport has no durable cursor replay")
             self._event_ready.set()          # see the redis path (#247)
             while self._event_running:
                 if str(self.client.account_id or "") != account_id:
                     return       # account changed -> rebuild against the new address
                 time.sleep(0.5)
         except Exception:
+            self._trade_events_ready = False
             time.sleep(1.0)
         finally:
             if channel is not None:
@@ -4628,6 +5051,8 @@ class BigQmtXtTrader:
 
         account_id = str(self.client.account_id or "")
         pubsub = None
+        self._trade_events_ready = False
+        streams = self._exec_streams_supported(redis_client)
         try:
             pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
             pubsub.subscribe(
@@ -4636,7 +5061,19 @@ class BigQmtXtTrader:
                 order_error_channel(account_id),
                 cancel_error_channel(account_id),
             )
-            # Subscribed for real -- release start()'s bounded wait (#247).
+            self._trade_events_generation += 1
+            if streams:
+                self._replay_event_streams(redis_client, account_id)
+                self._trade_events_ready = not self._event_reconciliation_required
+                self._last_event_error = ""
+            else:
+                # redis < 5.0 has no streams, so the server publishes without
+                # xadd (#163) and there is nothing to replay from. Events still
+                # arrive live over pub/sub -- but a missed one is gone, so the
+                # channel must not claim ready.
+                self._last_event_error = (
+                    "redis has no streams: live pub/sub only, no cursor replay")
+            # Subscribed and replayed -- release start()'s bounded wait (#247).
             self._event_ready.set()
             while self._event_running:
                 if str(self.client.account_id or "") != account_id:
@@ -4644,8 +5081,25 @@ class BigQmtXtTrader:
                 message = pubsub.get_message(timeout=1.0)
                 if not message or message.get("type") != "message":
                     continue
+                if streams:
+                    try:
+                        self._replay_event_streams(redis_client, account_id)
+                        continue
+                    except Exception as exc:
+                        # The stream read is the source of truth; when it fails
+                        # deliver the pub/sub copy rather than lose the event,
+                        # and stop claiming the channel is healthy. The cursor
+                        # stays put, so the stream re-delivers it later --
+                        # duplicates are the consumer's problem to dedupe
+                        # (plan section 8), silence is nobody's to detect.
+                        self._trade_events_ready = False
+                        self._last_event_error = "%s: %s" % (
+                            exc.__class__.__name__, exc)
                 self._dispatch_event(message.get("data"))
-        except Exception:
+        except Exception as exc:
+            self._trade_events_ready = False
+            self._last_event_error = "%s: %s" % (
+                exc.__class__.__name__, exc)
             time.sleep(1.0)
         finally:
             try:
@@ -4653,6 +5107,122 @@ class BigQmtXtTrader:
                     pubsub.close()
             except Exception:
                 pass
+
+    @staticmethod
+    def _exec_streams_supported(redis_client):
+        """Whether this Redis can answer the replay reads at all."""
+        return all(callable(getattr(redis_client, name, None))
+                   for name in ("xread", "xrange", "xrevrange",
+                                "hgetall", "hset", "expire"))
+
+    def _load_event_cursors(self, redis_client, account_id):
+        from .exec_events import load_exec_cursors
+
+        if self._event_cursor_account != account_id:
+            self._event_cursors = load_exec_cursors(
+                redis_client, account_id, self._event_consumer_id)
+            self._event_cursor_account = account_id
+        return dict(self._event_cursors)
+
+    def _replay_event_streams(self, redis_client, account_id):
+        """Drain the event streams from this consumer's persisted cursors.
+
+        Cursors advance only over events the callback accepted, so an event
+        the consumer refused is read again next round: at-least-once, never
+        at-most-once. A stream the consumer cannot replay (gap or cold start)
+        is reconciled by full query instead -- see read_exec_event_streams.
+        """
+        from .exec_events import (
+            persist_exec_cursors,
+            read_exec_event_streams,
+        )
+
+        cursors = self._load_event_cursors(redis_client, account_id)
+        result = read_exec_event_streams(
+            redis_client, account_id, cursors=cursors, count=500)
+        # Baseline is where each stream was read from, not where the read
+        # ended: adopting the end would silently swallow events the callback
+        # never accepted. Persisted even when nothing arrived, so a cold start
+        # is a one-off rather than a full reconcile per event.
+        acknowledged = dict(result.get("start_cursors") or cursors)
+        if acknowledged != cursors:
+            persist_exec_cursors(
+                redis_client, account_id, self._event_consumer_id,
+                acknowledged)
+        failure = None
+        for item in result.get("events") or []:
+            stream = str(item.get("stream") or "")
+            event = dict(item.get("event") or {})
+            if stream == "position_snapshot":
+                self._note_position_status(True)
+                delivered = True
+            else:
+                delivered = self._dispatch_event(event)
+            if not delivered:
+                # Stop at the first refusal: acking later events would strand
+                # this one behind a cursor that says it was consumed.
+                failure = "event callback did not acknowledge %s %s" % (
+                    stream, item.get("stream_id"))
+                break
+            acknowledged[stream] = str(item.get("stream_id") or "0-0")
+            persist_exec_cursors(
+                redis_client, account_id, self._event_consumer_id,
+                acknowledged)
+        self._event_cursors = acknowledged
+        gaps = list(result.get("gap_streams") or [])
+        self._event_reconciliation_required = bool(gaps)
+        if gaps and self._may_reconcile_now():
+            self.reconcile_events(account_id=account_id, gap_streams=gaps)
+        if failure is not None:
+            raise RuntimeError(failure)
+        return result
+
+    def _may_reconcile_now(self):
+        """Rate-limit the full reconcile query.
+
+        A gap that outlives its reconcile (an expired stream key, say) is
+        re-detected on every push; without this the bridge would answer a full
+        order/trade/position query per event.
+        """
+        if not _client_channel_status(self.client).get("rpc_ready"):
+            return False
+        last = float(self._last_event_reconciliation.get("at") or 0.0)
+        return (time.time() - last) >= self._event_reconcile_min_interval
+
+    def reconcile_events(self, account_id=None, gap_streams=()):
+        """Full query calibration for channels that could not be replayed.
+
+        Returns the snapshot itself (not just counts) so a consumer that lost
+        events can rebuild from it; the status only keeps the counts.
+        """
+        account_id = str(account_id or self.client.account_id or "")
+        execution = self.client.call(
+            "query_execution_snapshot",
+            {"account_id": account_id, "order_strategy_name": "",
+             "trade_strategy_name": ""},
+            account_id=account_id, use_formula=False) or {}
+        positions = self.client.call(
+            "query_stock_positions", {"account_id": account_id},
+            account_id=account_id, use_formula=False) or {}
+        orders = list(execution.get("orders") or [])
+        trades = list(execution.get("trades") or [])
+        self._last_event_reconciliation = {
+            "at": time.time(),
+            "gap_streams": sorted(gap_streams),
+            "orders": len(orders),
+            "trades": len(trades),
+            "positions": len(positions),
+        }
+        self._event_reconciliation_required = False
+        self._trade_events_ready = True
+        self._note_position_status(True)
+        return {
+            "at": self._last_event_reconciliation["at"],
+            "gap_streams": sorted(gap_streams),
+            "orders": orders,
+            "trades": trades,
+            "positions": positions,
+        }
 
     def _dispatch_event(self, raw):
         """Accepts raw bytes/str (Redis pub/sub) or an already-decoded dict.
@@ -4670,29 +5240,34 @@ class BigQmtXtTrader:
                 text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
                 event = json.loads(text)
             except Exception:
-                return
+                return False
         if not isinstance(event, dict):
-            return
+            return False
         # 放行超时的屏障, 再决定这条事件是直通还是暂存 (issue #51)。
         try:
             self._sweep_order_barriers()
             if event.get("event_type") in ("order", "trade", "order_error", "cancel_error") and self._hold_if_pending(event):
-                return
+                return True
         except Exception:
             pass  # 屏障故障绝不能吞掉事件
-        self._deliver_event(event)
+        delivered = self._deliver_event(event)
+        if delivered:
+            self._last_trade_event_at = time.time()
+        return delivered
 
     def _deliver_event(self, event):
         callback = self.callback
         if callback is None:
-            return
+            return False
         account_id = str(event.get("account_id") or self.client.account_id or "")
         try:
             event_type = event.get("event_type")
             if event_type == "trade":
                 callback.on_stock_trade(self._trade_from_dict(account_id, event))
+                return True
             elif event_type == "order":
                 callback.on_stock_order(self._order_from_dict(account_id, event))
+                return True
             elif event_type == "order_error":
                 _sysid = str(event.get("order_sys_id") or "")
                 callback.on_order_error(
@@ -4715,6 +5290,7 @@ class BigQmtXtTrader:
                         status=_safe_int(event.get("status", event.get("order_status")), 0),
                     )
                 )
+                return True
             elif event_type == "cancel_error":
                 _sysid = str(event.get("order_sys_id") or "")
                 callback.on_cancel_error(
@@ -4734,6 +5310,14 @@ class BigQmtXtTrader:
                         ),
                     )
                 )
+                return True
+            # An event type this client does not route is still consumed:
+            # refusing it would park the stream cursor on it forever and hold
+            # every later order and trade event behind it.
+            self._last_event_error = "unrouted event type: %s" % (event_type,)
+            log.warning("unrouted exec event type=%s account=%s",
+                        event_type, account_id)
+            return True
         except Exception:
             # 业务回调异常不能打崩事件线程，但必须留痕（issue: 静默吞错）。
             log.exception(
@@ -4741,6 +5325,7 @@ class BigQmtXtTrader:
                 event.get("event_type"),
                 account_id,
             )
+            return False
 
     def run_forever(self):
         while True:
@@ -4857,12 +5442,22 @@ class BigQmtXtTrader:
             return list(data.values())
         return _as_list(data)
 
+    def _note_position_status(self, ready):
+        ready = bool(ready)
+        if ready and not self._position_ready:
+            self._position_generation += 1
+        self._position_ready = ready
+        if ready:
+            self._last_position_sync_at = time.time()
+
     def query_stock_positions(self, account):
         account_id = _account_id(account, self.client.account_id)
         try:
             data = self.client.call("query_stock_positions", _with_account_type({"account_id": account_id}, account),
                                     account_id=account_id) or {}
+            self._note_position_status(True)
         except Exception:
+            self._note_position_status(False)
             if self._account_cache_usable(account_id, "query_stock_positions") is None:
                 raise
             data = self._cached_positions(account_id)
@@ -5122,10 +5717,12 @@ class BigQmtXtTrader:
         price,
         strategy_name,
         order_remark,
+        client_request_id=None,
     ):
         data = self.order_stock_result(
             account, stock_code, order_type, order_volume, price_type,
             price, strategy_name, order_remark,
+            client_request_id=client_request_id,
         )
         return self._order_id(data.get("order_sys_id"))
 
@@ -5185,6 +5782,7 @@ class BigQmtXtTrader:
     def order_stock_result(
         self, account, stock_code, order_type, order_volume, price_type,
         price, strategy_name, order_remark, wait_settlement=True,
+        client_request_id=None,
     ):
         """Submit one order over RPC.
 
@@ -5209,12 +5807,16 @@ class BigQmtXtTrader:
         }, account)
         if not wait_settlement:
             payload["wait_settlement"] = False
+        # Only when set: an existing client stand-in need not know the kwarg.
+        kwargs = {} if client_request_id is None else {
+            "client_request_id": client_request_id}
         tracked = getattr(self.client, "call_tracked", None)
         if tracked is None:
             # A client that cannot name its request (a test double): the
             # pre-#303 contract, where a timeout is honestly unknown.
             try:
-                return self.client.call("order_stock", payload, account_id=account_id) or {}
+                return self.client.call(
+                    "order_stock", payload, account_id=account_id, **kwargs) or {}
             except TimeoutError as exc:
                 raise TimeoutError(
                     "order_stock rpc timeout; user_order_id=%s. Query orders/trades before retrying to avoid duplicate orders. %s"
@@ -5223,9 +5825,10 @@ class BigQmtXtTrader:
         request_id = uuid.uuid4().hex
         try:
             return tracked("order_stock", payload, account_id=account_id,
-                           request_id=request_id) or {}
+                           request_id=request_id, **kwargs) or {}
         except TimeoutError as exc:
-            return self._order_stock_after_timeout(request_id, account_id, user_order_id, exc)
+            return self._order_stock_after_timeout(
+                request_id, account_id, user_order_id, exc, client_request_id)
 
     # After a timed-out order_stock: how long to keep asking the server what
     # became of it, and how often. Covers the server's own settlement wait
@@ -5233,7 +5836,8 @@ class BigQmtXtTrader:
     ORDER_TIMEOUT_FOLLOWUP_SECONDS = 5.0
     ORDER_TIMEOUT_FOLLOWUP_INTERVAL_SECONDS = 0.5
 
-    def _order_stock_after_timeout(self, request_id, account_id, user_order_id, exc):
+    def _order_stock_after_timeout(self, request_id, account_id, user_order_id, exc,
+                                   client_request_id=None):
         """Turn "timed out, state unknown" into an answer (#303).
 
         Under a burst the bridge runs orders one at a time, so a request can
@@ -5251,7 +5855,20 @@ class BigQmtXtTrader:
         A server without the method (older than #303) makes the query fail;
         that falls through to the old message, which was honest about not
         knowing.
+
+        With ``client_request_id`` the answer is typed instead: only
+        ``refused`` is RpcOrderRejectedError. ``unknown`` is ambiguous there,
+        since a bridge restart also forgets a request it did dispatch.
         """
+        ambiguous_timeout = {
+            "ok": False,
+            "method": "order_stock",
+            "account_id": str(account_id),
+            "client_request_id": str(client_request_id),
+            "order_outcome": "ambiguous",
+            "error_code": "ORDER_RPC_TIMEOUT",
+            "error": "order_stock rpc timeout; user_order_id=%s. %s" % (user_order_id, exc),
+        }
         deadline = time.time() + float(self.ORDER_TIMEOUT_FOLLOWUP_SECONDS)
         last_state = None
         while True:
@@ -5266,6 +5883,7 @@ class BigQmtXtTrader:
             last_state = str(outcome.get("state") or "")
             if last_state == "settled":
                 response = outcome.get("response") or {}
+                _raise_for_order_outcome(response)
                 if not response.get("ok"):
                     raise RpcServerRepliedError(
                         response.get("error") or "Big QMT RPC failed: order_stock")
@@ -5274,7 +5892,11 @@ class BigQmtXtTrader:
                     raise RpcServerRepliedError(
                         "Big QMT order_stock server_error: %s" % server_error)
                 return _restore_jsonable(response.get("data")) or {}
-            if last_state in ("refused", "unknown"):
+            if client_request_id is not None and last_state == "refused":
+                raise RpcOrderRejectedError(dict(
+                    ambiguous_timeout, order_outcome="rejected",
+                    error_code="ORDER_REJECTED_BEFORE_DISPATCH"))
+            if client_request_id is None and last_state in ("refused", "unknown"):
                 raise TimeoutError(
                     "order_stock rpc timeout; user_order_id=%s. The bridge did NOT place "
                     "this order (%s before dispatch): safe to retry, ideally with less "
@@ -5286,6 +5908,8 @@ class BigQmtXtTrader:
             if time.time() >= deadline:
                 break
             time.sleep(self.ORDER_TIMEOUT_FOLLOWUP_INTERVAL_SECONDS)
+        if client_request_id is not None:
+            raise RpcOrderAmbiguousError(dict(ambiguous_timeout, bridge_state=last_state))
         if last_state in ("dispatched", "dispatching"):
             raise TimeoutError(
                 "order_stock rpc timeout; user_order_id=%s. passorder DID run for this "
@@ -6238,7 +6862,8 @@ class BigQmtXtTrader:
             params["dry_run"] = True
         return self.client.call("passorder", params, account_id=account_id)
 
-    def cancel_order_stock_sysid(self, account, market, order_sysid):
+    def cancel_order_stock_sysid(self, account, market, order_sysid,
+                                 client_request_id=None):
         """MiniQMT contract: 0 on success, -1 on failure (issue #113).
 
         This returned a bool, which is worse than a type mismatch -- it inverts
@@ -6256,11 +6881,13 @@ class BigQmtXtTrader:
                 "order_sysid": self._resolve_order_sys_id(order_sysid),
             }, account),
             account_id=account_id,
+            client_request_id=client_request_id,
         ) or {}
         return 0 if bool(data.get("success", data)) else -1
 
-    def cancel_order_stock(self, account, order_id):
-        return self.cancel_order_stock_sysid(account, "", order_id)
+    def cancel_order_stock(self, account, order_id, client_request_id=None):
+        return self.cancel_order_stock_sysid(
+            account, "", order_id, client_request_id=client_request_id)
 
     def unsubscribe(self, account):
         # MiniQMT xttrader.unsubscribe(account) — 取消账户订阅。

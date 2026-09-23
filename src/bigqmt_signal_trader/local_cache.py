@@ -103,6 +103,8 @@ class LocalMarketCache:
     def __init__(self, cache_dir=None, fmt="auto"):
         self.cache_dir = str(cache_dir or os.path.join(os.path.expanduser("~"), ".bigqmt_cache"))
         self.fmt = _resolve_format(fmt)
+        self.read_hits = 0
+        self.read_misses = 0
 
     def _ext(self):
         return ".parquet" if self.fmt == "parquet" else ".pkl"
@@ -209,10 +211,12 @@ class LocalMarketCache:
         """Return the cached DataFrame for (code, period, dividend_type), filtered."""
         existing = self._existing_path(code, period, dividend_type)
         if not existing:
+            self.read_misses += 1
             return None
         try:
             df = self._read_file(existing)
         except Exception:
+            self.read_misses += 1
             return None
         axis, on_index = _time_axis(df)
         if axis:
@@ -234,6 +238,7 @@ class LocalMarketCache:
         if n > 0 and df.shape[0] > n:
             # 索引形态保留时间索引；列形态维持原 reset 行为。
             df = df.tail(n) if _time_axis(df)[1] else df.tail(n).reset_index(drop=True)
+        self.read_hits += 1
         return df
 
     def covered(self, code, period, dividend_type="none"):
@@ -259,3 +264,17 @@ class LocalMarketCache:
                     rel = os.path.relpath(root, self.cache_dir)
                     periods.add(rel.split(os.sep)[0] if rel != "." else rel)
         return files, sorted(periods)
+
+    def health_stats(self):
+        """Counters only -- no directory walk.
+
+        This one is polled by status endpoints; stats() walks the whole cache
+        tree and does not belong on that path.
+        """
+        reads = self.read_hits + self.read_misses
+        return {
+            "cache_dir": self.cache_dir,
+            "read_hits": self.read_hits,
+            "read_misses": self.read_misses,
+            "hit_rate": (float(self.read_hits) / reads) if reads else None,
+        }

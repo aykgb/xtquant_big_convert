@@ -863,8 +863,18 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
     def test_connect_and_subscribe_fire_account_status(self):
         trader, cb = self._trader()
         trader.client.account_id = "acct"
-        # connect() calls ping via RPC — stub it.
-        trader.client.call = lambda *a, **k: {"ok": True}
+        # connect() 走的是握手：版本、协议、脱敏账号和启动代次对不上就 fail-closed，
+        # 所以这里的桩要答一份完整的 pong，不能只 {"ok": True}。
+        from bigqmt_signal_trader.redis_rpc import RPC_PROTOCOL_VERSION
+        from bigqmt_signal_trader.version import __version__ as _version
+        trader.client.call = lambda *a, **k: {
+            "ok": True,
+            "version": _version,
+            "protocol_version": RPC_PROTOCOL_VERSION,
+            "account_id_masked": "acct",
+            "server_generation": "gen-1",
+            "supports": {"rpc": True},
+        }
         trader.connect()
         trader.subscribe("acct")
 
