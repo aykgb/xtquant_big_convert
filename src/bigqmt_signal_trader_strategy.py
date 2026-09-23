@@ -575,8 +575,12 @@ def _resolve_background_threads(transport_name, configured):
 
     ``configured`` is None when the local config never set
     ``rpc_background_threads`` (the runtime only forwards the key when it was
-    given explicitly) -- that case keeps the historical default: background
-    receiver threads on for every transport.
+    given explicitly). That used to mean the historical default -- receiver
+    threads on -- for every non-redis transport. Since #343 it means the
+    adjust drain wherever the transport can drain: measured on the live
+    terminal, drain is <= 1 tick on every transport while a background thread
+    pays a tick per GIL acquisition (zmq+thread 490ms for a deferred query,
+    zmq+drain 88ms). Only a transport with no drain keeps its thread.
 
     An explicit False opts into the adjust-driven drain instead: the transport
     is polled with a non-blocking recv from drain_request_queue on each adjust
@@ -598,11 +602,9 @@ def _resolve_background_threads(transport_name, configured):
     normalized = str(transport_name or "redis").lower()
     if _is_redis_transport(normalized):
         return bool(configured)
-    if configured is None:
+    if not _transport_can_drain(normalized):
         return True
-    if _transport_can_drain(normalized):
-        return bool(configured)
-    return True
+    return bool(configured)
 
 
 def _transport_can_drain(transport_name):
@@ -791,7 +793,7 @@ def _build_rpc_service(context_info, app, config):
         configured_bg = _config_bool(configured_bg, False)
     background_threads = _resolve_background_threads(transport_name, configured_bg)
     if background_threads and not configured_bg:
-        print("[bigqmt_rpc] transport=%s -> background_threads auto-enabled" % transport_name)
+        print("[bigqmt_rpc] transport=%s cannot drain -> background_threads forced on" % transport_name)
     # Build the transport. Redis is the default and reuses the existing clients/
     # templates (zero behavior change). zmq/mysql/shm go through the factory and
     # bypass the Redis clients entirely.
@@ -825,6 +827,10 @@ def _build_rpc_service(context_info, app, config):
         background_threads=background_threads,
         debug_log_limit=int(rpc_config.get("debug_log_limit", 5)),
         transport=transport,
+        # Heavy reads off the adjust thread in drain mode (#351); the runtime
+        # forwards rpc_heavy_offload / rpc_heavy_codes_threshold.
+        heavy_offload=_config_bool(rpc_config.get("heavy_offload"), True),
+        heavy_codes_threshold=int(rpc_config.get("heavy_codes_threshold", 20) or 20),
     )
     # Multi-account: when BIGQMT_ACCOUNT_TYPE_MAP has multiple entries,
     # build one RPC service per account sharing the same handlers.
@@ -862,6 +868,47 @@ def _start_rpc_service(context_info, app, config):
     return _rpc_service
 
 
+def _adjust_interval_seconds(config):
+    """schedule_adjust_interval as seconds, or None when unparseable."""
+    text = str(config.get("schedule_adjust_interval") or "3000nMilliSecond").strip().lower()
+    digits = ""
+    for ch in text:
+        if ch.isdigit() or ch == ".":
+            digits += ch
+        else:
+            break
+    unit = text[len(digits):].strip()
+    if unit.startswith("n"):
+        unit = unit[1:]
+    scale = {"millisecond": 0.001, "ms": 0.001, "second": 1.0, "s": 1.0,
+             "minute": 60.0, "m": 60.0, "hour": 3600.0, "h": 3600.0}.get(unit)
+    if not digits or scale is None:
+        return None
+    try:
+        return float(digits) * scale
+    except ValueError:
+        return None
+
+
+def _drain_budget_seconds(config, rpc_config):
+    """How long one adjust tick may keep the strategy thread draining (#303).
+
+    ``rpc.drain_budget_seconds`` when set; else one tick interval, never
+    under 0.5s. A 100ms tick gets 0.5s -- a couple of passorders, then the
+    thread goes back to QMT and the replies go out. A 3s tick keeps 3s, the
+    same work per tick as the old unbounded batch. 0 or a negative value
+    disables the bound.
+    """
+    explicit = rpc_config.get("drain_budget_seconds")
+    if explicit is not None and str(explicit).strip() != "":
+        value = float(explicit)
+        return value if value > 0 else None
+    interval = _adjust_interval_seconds(config)
+    if interval is None:
+        return None
+    return max(0.5, interval)
+
+
 def _drain_rpc_service(config):
     if _rpc_service is None:
         return 0
@@ -870,12 +917,30 @@ def _drain_rpc_service(config):
     processed = 0
     if hasattr(_rpc_service, "drain_request_queue"):
         processed += _rpc_service.drain_request_queue(max_items=max_items)
-    processed += _rpc_service.drain_pending(max_items=max_items)
+    try:
+        processed += _rpc_service.drain_pending(
+            max_items=max_items, budget_seconds=_drain_budget_seconds(config, rpc_config))
+    except TypeError:
+        # A service object from before the budget (a partial reload).
+        processed += _rpc_service.drain_pending(max_items=max_items)
     if _quote_subscription_service is not None:
         try:
             _quote_subscription_service[0].reap_expired()
         except Exception as exc:
             _log_err("quote_push", "reap failed: %s" % exc)
+    # #310 warm-up subscriptions (terminals whose get_full_tick answers only
+    # subscribed codes) are dropped once idle; getattr-guarded so a package
+    # from before the warm-up still drains.
+    # The provider hangs off the handlers (service.handlers.market_data); the
+    # service itself has no market_data, so reading it there found None and
+    # the adjust-loop prune never ran.
+    prune = getattr(getattr(getattr(_rpc_service, "handlers", None), "market_data", None),
+                    "prune_tick_subscriptions", None)
+    if callable(prune):
+        try:
+            prune()
+        except Exception as exc:
+            _log_err("full_tick", "warm-up prune failed: %s" % exc)
     return processed
 
 
@@ -1792,6 +1857,23 @@ def _enrich_event_identity(exec_events, config, account_id, event):
     return event
 
 
+def _event_account_id(obj):
+    """The account a native order / deal object names, or "" (#320).
+
+    Reading an attribute off a QMT object can itself raise (#76's
+    SystemError), and this runs on the C++ callback thread before the
+    guarded block below -- so it must never let anything out.
+    """
+    for name in ("m_strAccountID", "account_id"):
+        try:
+            value = getattr(obj, name, None)
+        except Exception:
+            return ""
+        if value:
+            return str(value).strip()
+    return ""
+
+
 def _publish_exec_event(kind, obj, context_info=None):
     """Push a normalized order/trade event to Redis for real-time client callbacks."""
     config = _build_config()
@@ -1812,7 +1894,13 @@ def _publish_exec_event(kind, obj, context_info=None):
             print("[bigqmt_exec_raw] snapshot %s failed: %s" % (kind, exc))
     if not _config_bool(event_config.get("enabled"), True):
         return
-    account_id = str(event_config.get("account_id") or config.get("account_id") or _account_id or "")
+    # The channel is per account, so it has to be THIS event's account: a
+    # callback for a secondary account (方式一) published under the
+    # configured primary landed where nobody was listening (#320, #322).
+    # The row names its account; the configured one is only the fallback.
+    account_id = str(
+        _event_account_id(obj)
+        or event_config.get("account_id") or config.get("account_id") or _account_id or "")
     if not account_id:
         return
     sink = _exec_event_sink(config)

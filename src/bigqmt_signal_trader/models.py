@@ -300,9 +300,11 @@ class AssetSnapshot:
     and None means "the terminal did not report it" — distinct from 0.0.
     """
 
-    def __init__(self, account_id, cash=None, total_asset=None, frozen_cash=None, market_value=None):
+    def __init__(self, account_id, cash=None, total_asset=None, frozen_cash=None, market_value=None, fetch_balance=None):
         self.account_id = account_id
         self.cash = cash
+        # Withdrawable funds; None means unreported, not zero or available cash.
+        self.fetch_balance = fetch_balance
         self.total_asset = total_asset
         self.frozen_cash = frozen_cash
         self.market_value = market_value
@@ -330,11 +332,16 @@ class OrderRequest:
         strategy_name,
         remark="",
         order_type=None,
+        account_type=None,
     ):
         # MiniQMT-style order_type (xtconstant). Only set for operations a
         # BUY/SELL action cannot express -- credit financing, repayment and the
         # special-margin family. None means an ordinary stock order.
         self.order_type = order_type
+        # The account type the request named (港股通: "HUGANGTONG" on a stock
+        # account id). The settlement lookup reads the order back under it;
+        # None means the account's default.
+        self.account_type = account_type
         self.signal_id = signal_id
         self.account_id = account_id
         self.action = action
@@ -377,6 +384,7 @@ class OrderSnapshot:
         offset_flag=None,
         direction=None,
         trade_amount=0.0,
+        op_type=None,
     ):
         self.order_sys_id = order_sys_id
         self.user_order_id = user_order_id
@@ -387,6 +395,11 @@ class OrderSnapshot:
         self.status = status
         self.price = price
         self.traded_price = traded_price
+        # The terminal's own m_nOpType (27 融资买入, 31 卖券还款, ...). BUY/SELL
+        # above is derived from it for bookkeeping; the client needs the
+        # original to report a credit order as its MiniQMT order_type instead
+        # of plain 23/24 (#330).
+        self.op_type = op_type
         self.strategy_name = strategy_name
         self.remark = remark
         # 报单时间, Unix 秒 -- MiniQMT XtOrder.order_time 的语义。0 = 未上报。
@@ -419,7 +432,7 @@ class TradeSnapshot:
                  traded_at="", user_order_id="", amount=0.0, strategy_name="",
                  traded_time=0, account_type=0, instrument_name="",
                  secu_account="", commission=0.0, offset_flag=None,
-                 direction=None):
+                 direction=None, op_type=None):
         self.trade_id = trade_id
         self.order_sys_id = order_sys_id
         self.stock_code = stock_code
@@ -444,6 +457,7 @@ class TradeSnapshot:
         self.commission = commission
         self.offset_flag = offset_flag
         self.direction = direction
+        self.op_type = op_type
 
 
 class OrderRef:

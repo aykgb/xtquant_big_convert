@@ -1,9 +1,13 @@
 # coding: utf-8
 """Client-side private config example for MiniQMT-compatible replacement.
 
-Copy this file to:
-
-    src/bigqmt_signal_trader_client_config.py
+Copy this file to ``bigqmt_signal_trader_client_config.py`` in the directory
+of the script that runs the client. It is found by ``import``, so it has to
+be on ``sys.path``: next to the script is simplest; anywhere on PYTHONPATH
+works; ``BIGQMT_CLIENT_CONFIG_MODULE=<module>`` names one explicitly. When
+none is found the client falls back to ``bigqmt_signal_trader_local_config``
+(the QMT-side file), which is why running from the QMT python directory
+happens to work and running from anywhere else does not.
 
 Do not commit the real file. It may contain account ids and Redis credentials.
 """

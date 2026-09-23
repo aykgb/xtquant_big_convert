@@ -15,6 +15,13 @@ BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
 # 一行全 0 的资产，表现为「信用账户资产全是 0」而日志里毫无线索（issue #92）。
 # 也可以写在下面 BIGQMT_REDIS_CONFIG 的 "account_type" 里，两处都认；解析结果
 # 会在启动时打印，冲突也会指出来。
+#
+# 同一个账号有几种类型（港股通）就写成列表，第一个是默认：
+#     BIGQMT_ACCOUNT_TYPE = ["STOCK", "HUGANGTONG", "SHENGANGTONG"]
+# 客户端 StockAccount(id, "HUGANGTONG") 的类型会随每个交易类请求传来，在列表里
+# 就按它查（港股通的持仓/委托/成交在终端里记在 HUGANGTONG / SHENGANGTONG 下，
+# 不在 STOCK 下）；不在列表里仍按默认答，并记一次日志。下单不用改：passorder
+# 的 23/24 对 .HK 代码就是港股通买卖。
 BIGQMT_ACCOUNT_TYPE = "STOCK"
 
 BIGQMT_REDIS_CONFIG = {
@@ -47,19 +54,35 @@ BIGQMT_REDIS_CONFIG = {
     # off the main strategy thread. That is enforced when the listener list is
     # expanded, so no value below can move them (#244).
     #
-    # rpc_background_threads is therefore a pure latency choice, and it differs
-    # per transport (100 read methods, live terminal -- docs/LATENCY_REPORT.md):
-    #     redis  True 3.4ms   / False 30.7ms   <- this file ships redis
-    #     zmq    True 592.9ms / False 15.8ms
-    #     pipe   True 189.0ms / False 94.4ms
-    # Only redis wants True: its brpop wake is immediate, while zmq/pipe
-    # background threads pay a cross-thread GIL handoff (~1 adjust tick) per
-    # round trip. Switching transport? Switch this too.
+    # rpc_background_threads is therefore a pure latency choice: False (the
+    # adjust-thread drain) for every transport. The drain costs at most one
+    # adjust tick; a background thread costs one tick per GIL acquisition and
+    # a round trip has several (#343, live terminal 2026-09-22, ms):
+    #     redis  True ping 407 / positions 197    False ping 102 / positions 103
+    #     zmq    True ping 103 / positions 490    False ping  87 / positions  88
+    # True is only for a transport that cannot drain (none of the shipped
+    # ones need it).
     "rpc_process_in_listener": True,
     "rpc_listener_methods": ("*",),
-    "rpc_background_threads": True,
+    "rpc_background_threads": False,
     "schedule_adjust": True,
     "schedule_adjust_interval": "100nMilliSecond",
+    # How long one adjust tick may keep the strategy thread running queued
+    # RPC requests (#303). Unset = one adjust interval, never under 0.5s;
+    # what does not fit waits for the next tick. 0 disables the bound.
+    # "drain_budget_seconds": 0.5,
+    # Heavy reads leave the adjust thread for one worker thread in drain mode
+    # (#351): financial data, formulas, and by size a market-token
+    # get_full_tick, > rpc_heavy_codes_threshold codes, tick period or a date
+    # window in get_market_data_ex. QMT releases the GIL for most of those
+    # reads, so the tick keeps its 100ms average and its worst case shrinks
+    # from the whole read to a fraction (measured: 200ms full-market
+    # get_full_tick -> tick max 0.25-0.33s; 2.1s get_financial_data -> ~0.5s).
+    # Their reply pays 1-2 ticks instead of one. download_* holds the GIL for
+    # the whole call and stays inline; light reads and every trade query stay
+    # on the adjust thread as before.
+    # "rpc_heavy_offload": True,
+    # "rpc_heavy_codes_threshold": 20,
     # The default mode calls get_full_tick through RPC. Enable this cache only
     # if full-market payloads are too large for your latency/CPU budget.
     # When a client calls get_full_tick, it renews demand for 10 seconds.

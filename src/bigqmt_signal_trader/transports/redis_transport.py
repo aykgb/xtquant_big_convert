@@ -97,6 +97,13 @@ class RedisTransport(RpcTransport):
     """Redis-backed transport. Owns rpush/blpop/brpop/publish/setex."""
 
     name = "redis"
+    # After the adjust-thread LPOP times out, the drain stays off for this
+    # long, doubling on every consecutive timeout up to the cap, and resets on
+    # the first LPOP that answers. A dead Redis host costs one
+    # socket_connect_timeout (1.5s) per probe; without a pause that was one
+    # per tick (live, 2026-09-17: 3.5 hours of 1.5s ticks).
+    DRAIN_TIMEOUT_BACKOFF_SECONDS = 5.0
+    DRAIN_TIMEOUT_BACKOFF_MAX_SECONDS = 30.0
 
     def __init__(
         self,
@@ -129,6 +136,11 @@ class RedisTransport(RpcTransport):
         self._pubsub = None
         self._thread = None
         self._queue_thread = None
+        # Adjust-thread LPOP backoff after a timeout (2026-09-17 outage). Monotonic clock:
+        # this is compared against time.monotonic() on every tick.
+        self._drain_backoff_until = 0.0
+        self._drain_backoff_seconds = 0.0
+        self._drain_timeouts = 0
         # Hooks so the service can observe/intercept received payloads (debug
         # logging, inline-vs-deferred dispatch). When None, the request is
         # delivered straight to the on_request callback.
@@ -289,12 +301,86 @@ class RedisTransport(RpcTransport):
             self.response_channel_template, account_id, request_id
         )
         response_list = request.get("reply_list")
+        if self._send_response_pipelined(
+                response_key, response_list, response_channel, ttl_seconds, payload):
+            return
         if response_key:
             self._write_response_key(response_key, ttl_seconds, payload)
         if response_list:
             self._push_response_list(response_list, ttl_seconds, payload)
         if response_channel:
             self._publish_response_channel(response_channel, payload)
+
+    def _send_response_pipelined(self, response_key, response_list, response_channel,
+                                 ttl_seconds, payload):
+        """The whole reply in ONE round trip, on ONE client (#343).
+
+        Every Redis command issued from the background listener thread lets
+        go of the GIL for the socket and then has to win it back from QMT's
+        main thread, and that costs about one adjust tick each (#104). The
+        per-command path below is SETEX + RPUSH + EXPIRE + PUBLISH -- and it
+        ran on the response client AND the listen client, so eight round
+        trips and eight re-acquisitions per reply. On the live terminal
+        (0.3.50, redis, rpc_background_threads=True, 100nMilliSecond) that
+        read as ``ping breakdown handle=0.0ms ... publish=500-700ms``: the
+        handler was free, the reply was the round trip.
+
+        The second client was never a second recipient -- it is the same
+        Redis -- so it is a fallback here, tried only when the first one
+        raises. Returns False when no client offers a pipeline (the older
+        test fakes), and the per-command path takes over unchanged.
+        """
+        clients = self._response_clients()
+        first_error = None
+        attempted = False
+        for client in clients:
+            pipeline_factory = getattr(client, "pipeline", None)
+            if not callable(pipeline_factory):
+                continue
+            try:
+                pipe = pipeline_factory(transaction=False)
+            except TypeError:
+                pipe = pipeline_factory()
+            if not callable(getattr(pipe, "execute", None)):
+                continue
+            attempted = True
+            try:
+                publish_index = None
+                queued = 0
+                if response_key:
+                    if ttl_seconds > 0:
+                        pipe.setex(response_key, ttl_seconds, payload)
+                    else:
+                        pipe.set(response_key, payload)
+                    queued += 1
+                if response_list:
+                    pipe.rpush(response_list, payload)
+                    queued += 1
+                    if ttl_seconds > 0:
+                        pipe.expire(response_list, ttl_seconds)
+                        queued += 1
+                if response_channel:
+                    pipe.publish(response_channel, payload)
+                    publish_index = queued
+                    queued += 1
+                results = pipe.execute() if queued else []
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                continue
+            if response_channel:
+                receivers = 0
+                try:
+                    receivers = int(results[publish_index] or 0)
+                except Exception:
+                    pass
+                self._published_count += 1
+                if self._published_count <= self.debug_log_limit:
+                    print("%s published response receivers=%s" % (self.print_prefix, receivers))
+            return True
+        if not attempted:
+            return False
+        raise first_error
 
     def _write_response_key(self, response_key, ttl_seconds, payload):
         first_error = None
@@ -349,15 +435,50 @@ class RedisTransport(RpcTransport):
 
     # -- non-background drain helpers (used by the strategy adjust thread) -
     def drain_request_queue(self, max_items=20):
+        """Non-blocking LPOP fallback used when the BRPOP loop is off.
+
+        ``rpc_background_threads=True`` already owns this Redis list via
+        ``_queue_loop``. LPOP on the adjust thread would steal read RPCs
+        such as ``get_market_data_ex`` onto QMT's main thread and stall the
+        100ms cadence (observed drain 0.6-1.8s). Skip while that thread is
+        alive; if it dies, LPOP becomes the fallback.
+        """
+        queue_thread = self._queue_thread
+        if queue_thread is not None and queue_thread.is_alive():
+            if not getattr(self, "_skip_adjust_queue_drain_logged", False):
+                print(
+                    "%s skip adjust LPOP drain; background BRPOP owns %s"
+                    % (self.print_prefix, self.request_queue)
+                )
+                self._skip_adjust_queue_drain_logged = True
+            return 0
+        # getattr: an instance built without __init__ (test fakes, a partial
+        # reload) has no backoff state and simply never pauses.
+        if time.monotonic() < getattr(self, "_drain_backoff_until", 0.0):
+            return 0
         processed = 0
         for _ in range(int(max_items)):
             try:
                 item = self.listen_redis.lpop(self.request_queue)
             except Exception as exc:
                 if _is_redis_timeout(exc):
-                    print("%s ERROR drain timeout on LPOP queue=%s; skip this tick" % (self.print_prefix, self.request_queue))
+                    # This LPOP just held the adjust thread for the whole
+                    # socket timeout. Pause the drain rather than pay it
+                    # again on the next tick: a Redis host that was down for
+                    # 3.5 hours (2026-09-17, 192.168.8.13) turned the
+                    # strategy's 100ms cadence into 1.5s for the duration --
+                    # "adjust cadence: ticks=7 avg=1.509s" for 1212 windows
+                    # -- and the strategy's own tick_app with it.
+                    self._note_drain_timeout()
                     break
                 raise
+            if getattr(self, "_drain_timeouts", 0):
+                print(
+                    "%s drain LPOP recovered after %d timeout(s); queue=%s"
+                    % (self.print_prefix, self._drain_timeouts, self.request_queue)
+                )
+                self._drain_timeouts = 0
+                self._drain_backoff_seconds = 0.0
             if not item:
                 break
             if self.on_raw_payload is not None:
@@ -366,6 +487,31 @@ class RedisTransport(RpcTransport):
                 self.deliver(_loads(item))
             processed += 1
         return processed
+
+    def _note_drain_timeout(self):
+        """Record an adjust-thread LPOP timeout and schedule the pause.
+
+        5s, then 10, 20, 30, 30... while the timeouts keep coming; the first
+        LPOP that answers resets it. During the pause drain_request_queue
+        returns 0 at once, so the adjust tick keeps its cadence and the
+        strategy's own work runs on time; requests wait in the Redis list
+        (or fail on the client side, which is what a dead Redis means) and
+        are picked up by the first probe that gets through.
+        """
+        self._drain_timeouts = getattr(self, "_drain_timeouts", 0) + 1
+        previous = getattr(self, "_drain_backoff_seconds", 0.0)
+        if previous <= 0:
+            self._drain_backoff_seconds = float(self.DRAIN_TIMEOUT_BACKOFF_SECONDS)
+        else:
+            self._drain_backoff_seconds = min(
+                previous * 2.0, float(self.DRAIN_TIMEOUT_BACKOFF_MAX_SECONDS))
+        self._drain_backoff_until = time.monotonic() + self._drain_backoff_seconds
+        print(
+            "%s ERROR drain timeout on LPOP queue=%s (timeout #%d); drain paused %.0fs "
+            "so the adjust tick runs on without it"
+            % (self.print_prefix, self.request_queue, self._drain_timeouts,
+               self._drain_backoff_seconds)
+        )
 
     def stop(self):
         super(RedisTransport, self).stop()

@@ -118,7 +118,9 @@ class RenderedConfigTest(unittest.TestCase):
         (592.9ms vs 15.8ms) and redis 9x (30.7ms vs 3.4ms) -- see #244 and
         docs/LATENCY_REPORT.md.
         """
-        wants_background = {"redis": True, "zmq": False,
+        # #343: every transport drains. redis's "True is faster" was the
+        # adjust thread's LPOP stealing the request; #321 removed that.
+        wants_background = {"redis": False, "zmq": False,
                             "pipe": False, "mysql": False}
         for transport, expected in sorted(wants_background.items()):
             loaded = _load(init_config.render_server_config(
@@ -131,7 +133,7 @@ class RenderedConfigTest(unittest.TestCase):
     def test_the_order_switch_does_not_change_the_threading_mode(self):
         for answers in (_answers(), _answers(allow_order_methods=True)):
             loaded = _load(init_config.render_server_config(answers), "s.py")
-            self.assertIs(loaded["BIGQMT_REDIS_CONFIG"]["rpc_background_threads"], True)
+            self.assertIs(loaded["BIGQMT_REDIS_CONFIG"]["rpc_background_threads"], False)
 
     def test_zmq_client_gets_a_concrete_connect_address(self):
         loaded = _load(init_config.render_client_config(
@@ -380,6 +382,76 @@ class SingleFileInjectionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             init_config.inject_single_file_config("print('no config here')\n",
                                                   _answers())
+
+
+class SingleFileFromPipInstallTest(unittest.TestCase):
+    """pip 安装不带 tools/，单文件构建必须能吃包内副本（用户实测踩过：
+    builder not found: ...miniconda3\Lib\tools\build_single_file.py）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.bogus_root = os.path.join(self.tmp, "no-tools-here")
+        os.makedirs(self.bogus_root)
+
+    def _answers(self, **overrides):
+        overrides.setdefault("qmt_python_dir", self.tmp)
+        overrides.setdefault("client_dir", self.tmp)
+        return _answers(**overrides)
+
+    def _silence(self, text):
+        pass
+
+    def test_redis_single_file_builds_from_packaged_copy(self):
+        written = init_config.apply(
+            self._answers(deployment="single_file"), self.bogus_root,
+            self._silence, input, force=True)
+
+        target = os.path.join(self.tmp, "BIGQMT_REDIS_DRYRUN_ALL_IN_ONE.py")
+        self.assertIn(target, written)
+        with io.open(target, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("_EMBEDDED_SOURCES", text)
+        # the answers were baked into the config block, not the placeholders
+        self.assertIn("'10.0.0.5'", text)
+        self.assertNotIn("YOUR_ACCOUNT_ID", text)
+
+    def test_no_redis_flat_builds_from_packaged_copy(self):
+        written = init_config.apply(
+            self._answers(deployment="single_file_no_redis"), self.bogus_root,
+            self._silence, input, force=True)
+
+        target = os.path.join(self.tmp, "BIGQMT_DRYRUN_NO_REDIS_FLAT_ALL_IN_ONE.py")
+        self.assertIn(target, written)
+        with io.open(target, encoding="gbk") as handle:
+            text = handle.read()
+        self.assertIn("_MODULE_FUNCS", text)
+        self.assertIn("'10.0.0.5'", text)
+
+    def test_missing_builder_error_names_the_escape_hatches(self):
+        orig = init_config._materialize_packaged_builder
+        init_config._materialize_packaged_builder = lambda script: None
+        try:
+            with self.assertRaisesRegex(ValueError, "--repo-root"):
+                init_config.build_single_file(
+                    self.bogus_root, "single_file", self._answers())
+        finally:
+            init_config._materialize_packaged_builder = orig
+
+    def test_packaged_copies_stay_in_sync_with_tools(self):
+        """The wheel ships tools/ builders as _singlefile/*.txt; a drifted
+        copy would mean pip users build from stale sources."""
+        import pkgutil
+        for script, _name, _encoding in init_config.BUILDERS.values():
+            with open(os.path.join(ROOT, "tools", script), "rb") as handle:
+                source = handle.read()
+            packaged = pkgutil.get_data(
+                "bigqmt_signal_trader", "_singlefile/%s.txt" % script)
+            self.assertEqual(source, packaged, "stale packaged copy: %s" % script)
+        with open(os.path.join(ROOT, "bigqmt_no_redis", "zmq_transport.py"), "rb") as handle:
+            source = handle.read()
+        packaged = pkgutil.get_data(
+            "bigqmt_signal_trader", "_singlefile/zmq_transport.py.txt")
+        self.assertEqual(source, packaged, "stale packaged copy: zmq_transport.py")
 
 
 if __name__ == "__main__":

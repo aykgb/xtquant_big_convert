@@ -1022,7 +1022,10 @@ class RedisRpcTest(unittest.TestCase):
     def test_native_empty_queries_remain_successful_rpc_results(self):
         cases = (
             ("get_positions", ["POSITION"], {}),
-            ("query_stock_positions", ["POSITION"], {}),
+            # #306: query_stock_positions is MiniQMT-list-shaped now (both
+            # directions of one contract survive); the legacy dict shape is
+            # get_positions only.
+            ("query_stock_positions", ["POSITION"], []),
             ("query_orders", ["ORDER"], []), ("query_stock_orders", ["ORDER"], []),
             ("query_trades", ["DEAL"], []), ("query_stock_trades", ["DEAL"], []),
             ("query_execution_snapshot", ["ORDER", "DEAL"], None),
@@ -1275,10 +1278,9 @@ class RedisRpcTest(unittest.TestCase):
             response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:%s" % request_id])
             self.assertTrue(response["ok"], response["error"])
 
-        self.assertEqual(
-            json.loads(redis_client.kv["bigqmt:rpc:resp:acct:alias-pos"])["data"]["600000.SH"]["volume"],
-            1000,
-        )
+        alias_pos = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:alias-pos"])["data"]
+        # #306: a list of position rows keyed by nothing -- one entry here.
+        self.assertEqual([row["volume"] for row in alias_pos], [1000])
         self.assertEqual(
             json.loads(redis_client.kv["bigqmt:rpc:resp:acct:alias-asset"])["data"]["cash"],
             100.0,

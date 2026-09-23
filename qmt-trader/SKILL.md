@@ -5,6 +5,11 @@ description: "通过统一 CLI 脚本驱动大 QMT 迅投量化交易端的全�
 
 # QMT Trader — 大模型驱动的 QMT 交易/行情工具
 
+## 来源
+
+- 仓库：https://github.com/litaolemo/xtquant_big_convert
+- 技能目录：https://github.com/litaolemo/xtquant_big_convert/tree/main/qmt-trader
+
 ## 概述
 
 本 skill 提供一个确定性 CLI 脚本 `scripts/qmt.py`，让大模型通过命令行调用大 QMT 的全部

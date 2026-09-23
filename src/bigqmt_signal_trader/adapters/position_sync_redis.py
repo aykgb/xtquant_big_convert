@@ -39,6 +39,7 @@ class RedisPositionSyncSink:
             "updated_at": self._time_text(snapshot.updated_at),
             "asset": {
                 "cash": snapshot.asset.cash,
+                "fetch_balance": getattr(snapshot.asset, "fetch_balance", None),
                 "total_asset": snapshot.asset.total_asset,
                 # Carried so the client's cached-asset fallback exposes the same
                 # fields as a live query_stock_asset.

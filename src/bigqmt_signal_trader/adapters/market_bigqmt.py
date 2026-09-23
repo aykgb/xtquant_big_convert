@@ -26,6 +26,7 @@ The split matters. Per the official docs and the ContextInfo IDE stub
 This module does not make trading decisions.
 """
 
+import datetime as _dt
 import importlib
 import time
 
@@ -36,6 +37,12 @@ from ..quote_utils import find_code_payload, is_option_code, latest_quote_row
 
 
 log = get_logger("market")
+
+
+def _ignore_tick_push(data):
+    """Callback for the #310 warm-up subscriptions: the snapshot is read back
+    with get_full_tick, so the pushes themselves are not needed."""
+    return None
 
 
 MARKET_CODES = {"SH", "SZ", "BJ", "HK"}
@@ -69,6 +76,10 @@ SECTOR_BY_TYPE = {
     "etf": "沪深ETF",
     "index": "沪深指数",
     "convertible": "沪深转债",
+    # Aliases for the same sector: what people actually type.
+    "cbond": "沪深转债",
+    "cb": "沪深转债",
+    "convertible_bond": "沪深转债",
 }
 
 
@@ -933,6 +944,11 @@ class BigQmtMarketDataProvider:
         """
         requested = list(codes or [])
         normalized_codes = [normalize_market_or_stock_code(code) for code in requested]
+        # What the caller asked for, tokens still tokens: this is what gets
+        # subscribed if the terminal answers only subscribed codes (#310). The
+        # expanded stock listing below is the wrong unit for that -- one
+        # whole-quote subscription on "SH" covers it.
+        subscribe_targets = list(normalized_codes)
         # Default to stocks. A market token lists every instrument the exchange
         # carries and stocks are 8.7% of it, so the old default made everyone pay
         # 7.5s for a 0.9s answer. types=["all"] restores the full listing.
@@ -955,6 +971,7 @@ class BigQmtMarketDataProvider:
         data = self.context_info.get_full_tick(normalized_codes) or {}
         if not isinstance(data, dict):
             return data or {}
+        data = self._recover_unsubscribed_ticks(subscribe_targets, normalized_codes, data)
 
         # Full Big-QMT 2.1.19.0 can return no entry from get_full_tick for an
         # explicitly requested .SHO/.SZO contract even while its tick stream is
@@ -1009,6 +1026,153 @@ class BigQmtMarketDataProvider:
             (original_by_upper.get(str(key).upper(), key), value)
             for key, value in data.items()
         )
+
+    # Issue #310: on Jianghai big-QMT 2.1.19.0, ContextInfo.get_full_tick
+    # answers only codes that hold a live quote subscription. An unsubscribed
+    # code yields no entry -- not an error -- so a ticking terminal returned {}
+    # for every explicit code and for whole-market tokens alike, while ping,
+    # positions and get_market_data_ex were all fine. subscribe_whole_quote on
+    # the code and asking again a few seconds later produced the full
+    # five-level book. Guojin's build answers unsubscribed codes, so this path
+    # only runs when the native call left a requested code unanswered: a
+    # terminal that never does that never subscribes anything here.
+    #
+    # Subscriptions are held per request batch and dropped after
+    # TICK_SUBSCRIBE_IDLE_SECONDS without a get_full_tick that touched them;
+    # pruning happens on the next get_ticks call and, when the strategy loop
+    # wires it, from prune_tick_subscriptions on every adjust tick.
+    TICK_SUBSCRIBE_WAIT_SECONDS = 2.0
+    TICK_SUBSCRIBE_POLL_SECONDS = 0.1
+    TICK_SUBSCRIBE_IDLE_SECONDS = 300.0
+
+    def _tick_subscription_state(self):
+        state = getattr(self, "_tick_subscription_state_dict", None)
+        if state is None:
+            import threading
+            state = self._tick_subscription_state_dict = {
+                "lock": threading.RLock(),
+                "groups": [],        # [handle, set(codes), last_used]
+                "by_code": {},       # code -> group
+            }
+        return state
+
+    @staticmethod
+    def _tick_unanswered(targets, data):
+        """Requested codes the snapshot has no entry for. A market token counts
+        as answered when any key carries its suffix."""
+        answered = {str(key).upper() for key in (data or {})}
+        missing = []
+        for code in targets:
+            text = str(code)
+            if text in EXCHANGE_TOKENS:
+                suffix = "." + text
+                if not any(key.endswith(suffix) for key in answered):
+                    missing.append(text)
+            elif text.upper() not in answered:
+                missing.append(text)
+        return missing
+
+    def tick_subscription_status(self):
+        """Read-only view of the #310 warm-up subscriptions, for diagnostics."""
+        state = self._tick_subscription_state()
+        now = time.monotonic()
+        with state["lock"]:
+            return [
+                {"handle": handle, "codes": sorted(codes),
+                 "idle_seconds": round(now - last_used, 1)}
+                for handle, codes, last_used in state["groups"]
+            ]
+
+    def prune_tick_subscriptions(self, now=None):
+        """Unsubscribe warm-up groups idle longer than TICK_SUBSCRIBE_IDLE_SECONDS.
+        Returns the number of groups closed. Safe to call from the adjust loop."""
+        state = getattr(self, "_tick_subscription_state_dict", None)
+        if state is None:
+            return 0
+        now = time.monotonic() if now is None else now
+        idle = float(self.TICK_SUBSCRIBE_IDLE_SECONDS)
+        expired = []
+        with state["lock"]:
+            keep = []
+            for group in state["groups"]:
+                if now - group[2] > idle:
+                    expired.append(group)
+                    for code in group[1]:
+                        state["by_code"].pop(code, None)
+                else:
+                    keep.append(group)
+            state["groups"] = keep
+        unsubscribe = getattr(self.context_info, "unsubscribe_quote", None)
+        for handle, codes, _last_used in expired:
+            try:
+                if callable(unsubscribe):
+                    unsubscribe(handle)
+            except Exception as exc:
+                log.warning("full tick warm-up unsubscribe(%s) failed for %s: %s",
+                            handle, sorted(codes), exc)
+        return len(expired)
+
+    def _recover_unsubscribed_ticks(self, targets, query_codes, data):
+        """Subscribe the requested codes the snapshot left unanswered, then
+        re-read until they appear or TICK_SUBSCRIBE_WAIT_SECONDS elapses.
+
+        Only codes with no warm-up subscription yet are subscribed and waited
+        for. A code that is already subscribed and still unanswered is QMT's
+        answer (halted, delisted, pre-open) and is returned as such without
+        another wait, so a warm terminal pays nothing per call.
+        """
+        subscribe = getattr(self.context_info, "subscribe_whole_quote", None)
+        if not callable(subscribe):
+            return data
+        missing = self._tick_unanswered(targets, data)
+        state = self._tick_subscription_state()
+        now = time.monotonic()
+        self.prune_tick_subscriptions(now)
+        with state["lock"]:
+            by_code = state["by_code"]
+            for code in targets:
+                group = by_code.get(str(code))
+                if group is not None:
+                    group[2] = now
+            fresh = [code for code in missing if code not in by_code]
+        if not fresh:
+            return data
+        try:
+            handle = subscribe(list(fresh), callback=_ignore_tick_push)
+            value = int(handle)
+        except Exception as exc:
+            value = -1
+            handle = exc
+        if value <= 0:
+            if not getattr(self, "_tick_subscribe_warned", False):
+                self._tick_subscribe_warned = True
+                log.warning("full tick warm-up subscribe_whole_quote(%s) failed: %r",
+                            fresh, handle)
+            return data
+        with state["lock"]:
+            group = [value, set(fresh), now]
+            state["groups"].append(group)
+            for code in fresh:
+                state["by_code"][code] = group
+        deadline = now + float(self.TICK_SUBSCRIBE_WAIT_SECONDS)
+        poll = float(self.TICK_SUBSCRIBE_POLL_SECONDS)
+        while True:
+            time.sleep(poll)
+            retry = self.context_info.get_full_tick(query_codes) or {}
+            if isinstance(retry, dict) and retry:
+                merged = dict(data)
+                merged.update(retry)
+                data = merged
+                if not self._tick_unanswered(fresh, data):
+                    break
+            if time.monotonic() >= deadline:
+                break
+        still_missing = self._tick_unanswered(fresh, data)
+        log.info("full tick warm-up: subscribed %s (handle %s), %s after %.1fs",
+                 fresh, value,
+                 "all answered" if not still_missing else "still empty: %s" % still_missing,
+                 time.monotonic() - now)
+        return data
 
     def get_instrument(self, code):
         normalized = normalize_stock_code(code)
@@ -1230,7 +1394,19 @@ class BigQmtMarketDataProvider:
             # short of it was never padded, so trimming its head would drop
             # real bars. Verified live -- 1y count=10 comes back as exactly 10
             # rows, 7 of them pad.
-            if count > 0 and len(pairs) >= count:
+            #
+            # A date window (count=-1 with a start_time) is padded the same
+            # way when the window starts before the terminal's local coverage
+            # (#335: 601318.SH 1mon from 20250901 with 1d data anchored at
+            # 2025-12-10 -- three head rows flat at 68.40, the first real
+            # close, zero turnover; MiniQMT returns no rows for those months).
+            # There is no count to fall short of, so every leading flat
+            # zero-turnover row at the head of a window is pad. The servant
+            # is called with its default skip_paused=True, so a genuinely
+            # suspended period does not come back as a row here in the first
+            # place -- the only flat zero-turnover rows it produces are pad.
+            window_request = count <= 0 and bool(str(kwargs.get("start_time") or "").strip())
+            if (count > 0 and len(pairs) >= count) or window_request:
                 pad = _leading_synthetic_bars([row for _label, row in pairs])
                 if pad:
                     trimmed += pad
@@ -1679,6 +1855,137 @@ class BigQmtMarketDataProvider:
             "download_financial_data2", _via_context, stock_list, table_list or [], start_time, end_time
         )
 
+    # The financial download probe (#277). One code, one table, a ~30-day
+    # window: small enough that a working service answers in well under a
+    # second, real enough that "the function exists" and "a download actually
+    # happens" come apart.
+    DOWNLOAD_PROBE_STOCK = "000001.SZ"
+    DOWNLOAD_PROBE_TABLE = "Capital"
+    DOWNLOAD_PROBE_WINDOW_DAYS = 30
+    _DOWNLOAD_PROBE_FUNCS = ("download_financial_data", "download_financial_data2")
+
+    def probe_download_channels(self, dial=True):
+        """Tell "download API exposed" apart from "standalone update usable".
+
+        probe_capabilities used to list ``download_financial_data`` as
+        available whenever the function existed. On a Big QMT terminal whose
+        miniQMT (the 58610 xtdata service) is not running, that is exactly the
+        case that misleads (#277): the SDK function is there and callable, the
+        existing financial rows read back fine, and the download itself dies
+        with ``无法连接行情服务`` -- a reporter with a full financial library
+        and no way to refresh it. "Exists" was answering the wrong question.
+
+        So this makes one real, tiny SDK download call and reports what it
+        did. Both download functions sit on the same data service, so the dial
+        is made once (through ``download_financial_data``) and the verdict is
+        shared; a second multi-second failure would prove nothing new. The
+        dial deliberately bypasses the ``_native_dead_marks`` cache: a cached
+        failure is the memory of an earlier dial, and the probe's job is to
+        measure now. It does update the cache afterwards, so a real caller
+        arriving next does not pay the timeout again.
+
+        The read-back through ``get_financial_data`` is reported under its own
+        key precisely because it proves something different: rows already on
+        disk are readable, which says nothing about whether they can be
+        updated. That distinction is the whole point of the probe.
+        """
+        report = {
+            "probe_call": {
+                "stock_list": [self.DOWNLOAD_PROBE_STOCK],
+                "table_list": [self.DOWNLOAD_PROBE_TABLE],
+            },
+            "functions": {},
+            "sdk_call": {"attempted": False},
+            "readback_existing_rows": {},
+        }
+        today = _dt.date.today()
+        start = today - _dt.timedelta(days=self.DOWNLOAD_PROBE_WINDOW_DAYS)
+        report["probe_call"]["start_time"] = start.strftime("%Y%m%d")
+        report["probe_call"]["end_time"] = today.strftime("%Y%m%d")
+
+        try:
+            module = self._native()
+        except Exception as exc:
+            module = None
+            report["native_xtdata_error"] = "%s: %s" % (exc.__class__.__name__, exc)
+        report["native_xtdata_loaded"] = module is not None
+        context_info = getattr(self, "context_info", None)
+        for name in self._DOWNLOAD_PROBE_FUNCS:
+            report["functions"][name] = {
+                "sdk_exposed": callable(getattr(module, name, None)),
+                "contextinfo_exposed": callable(getattr(context_info, name, None)),
+            }
+
+        dial_name = self._DOWNLOAD_PROBE_FUNCS[0]
+        dial_fn = getattr(module, dial_name, None) if module is not None else None
+        if not callable(dial_fn):
+            report["sdk_call"]["reason"] = "%s is not exposed by the native xtdata SDK" % dial_name
+        elif not dial:
+            report["sdk_call"]["reason"] = "skipped on request (download_probe=false)"
+        else:
+            started = time.time()
+            call = {"attempted": True, "function": dial_name}
+            try:
+                dial_fn(stock_list=[self.DOWNLOAD_PROBE_STOCK],
+                        table_list=[self.DOWNLOAD_PROBE_TABLE],
+                        start_time=report["probe_call"]["start_time"],
+                        end_time=report["probe_call"]["end_time"])
+                call["ok"] = True
+                self._native_dead_marks().pop(dial_name, None)
+            except Exception as exc:
+                call["ok"] = False
+                call["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+                self._native_dead_marks()[dial_name] = time.time()
+            call["seconds"] = round(time.time() - started, 3)
+            report["sdk_call"] = call
+
+        # Existing rows: readable is not the same as updatable, hence the key.
+        readback = {"note": "rows already on disk being readable does not mean they can be updated"}
+        try:
+            rows = self.get_financial_data(
+                [self.DOWNLOAD_PROBE_STOCK], [self.DOWNLOAD_PROBE_TABLE],
+                report["probe_call"]["start_time"], report["probe_call"]["end_time"])
+            readback["ok"] = True
+            readback["rows"] = self._count_probe_rows(rows)
+        except Exception as exc:
+            readback["ok"] = False
+            readback["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+        report["readback_existing_rows"] = readback
+
+        sdk_call = report["sdk_call"]
+        for name, entry in report["functions"].items():
+            if not entry["sdk_exposed"] and not entry["contextinfo_exposed"]:
+                entry["verdict"] = "not_exposed"
+            elif not entry["sdk_exposed"]:
+                # ContextInfo has never had these on a Big QMT terminal; if a
+                # broker build does, nothing here exercised it.
+                entry["verdict"] = "contextinfo_only_untested"
+            elif not sdk_call.get("attempted"):
+                entry["verdict"] = "exposed_untested"
+            elif sdk_call.get("ok"):
+                entry["verdict"] = "update_usable"
+            else:
+                entry["verdict"] = "exposed_but_service_unreachable"
+        return report
+
+    @staticmethod
+    def _count_probe_rows(rows):
+        """Row count for whatever get_financial_data answered with.
+
+        Big QMT answers a Series / DataFrame / Panel depending on how many
+        codes and dates were asked for; the probe asks for one code over a
+        window, so a DataFrame is the usual shape and ``len`` is its row
+        count. ``empty`` catches a DataFrame that has columns and no rows.
+        """
+        if rows is None:
+            return 0
+        if getattr(rows, "empty", False) is True:
+            return 0
+        try:
+            return len(rows)
+        except TypeError:
+            return 1
+
     # Well-known sector names that Big QMT's ContextInfo recognises for
     # get_stock_list_in_sector / get_sector. Used as a fallback when the full
     # sector list is not enumerable (Big QMT has no get_sector_list method and
@@ -1908,8 +2215,65 @@ class BigQmtMarketDataProvider:
         return self._call_context("get_option_iv", opt_code)
 
     def get_option_detail_data(self, stockcode):
-        # ContextInfo stub: get_option_detail_data(stockcode)
-        return self._call_context("get_option_detail_data", stockcode)
+        # ContextInfo returns fewer fields than miniQMT's xtdata wrapper. Fill
+        # the deterministic compatibility fields without inventing TradingDay.
+        raw = self._call_context("get_option_detail_data", stockcode)
+        if not raw:
+            return raw
+        detail = dict(raw)
+
+        if not detail.get("InstrumentName"):
+            try:
+                instrument = self.get_instrument(stockcode)
+            except Exception:
+                instrument = {}
+            name = instrument.get("InstrumentName") if instrument else None
+            if name:
+                detail["InstrumentName"] = name
+
+        underlying_code = detail.get("OptUndlCode")
+        underlying_market = detail.get("OptUndlMarket")
+        if (not detail.get("OptUndlCodeFull") and underlying_code
+                and underlying_market):
+            detail["OptUndlCodeFull"] = "%s.%s" % (
+                underlying_code, str(underlying_market).upper())
+
+        if not detail.get("ProductCode"):
+            product_id = str(detail.get("ProductID") or "")
+            exchange_id = str(detail.get("ExchangeID") or "").upper()
+            if product_id.endswith("_o") and underlying_market:
+                detail["ProductCode"] = "%s.%s" % (
+                    product_id[:-2], str(underlying_market).upper())
+            elif exchange_id in ("ZF", "CZCE") and product_id and underlying_market:
+                detail["ProductCode"] = "%s.%s" % (
+                    product_id[:-1], str(underlying_market).upper())
+            elif detail.get("OptUndlCodeFull"):
+                detail["ProductCode"] = detail["OptUndlCodeFull"]
+        return detail
+
+    def get_option_detail_data_batch(self, stockcodes):
+        """Return option details for many contracts in one bridge request.
+
+        ContextInfo only exposes the single-contract API, so the QMT-side
+        adapter deliberately performs the loop here.  One bad contract must
+        not discard the other results; failed or empty details are represented
+        by an empty dict under the original contract code.
+        """
+        if isinstance(stockcodes, (str, bytes)) or not isinstance(
+                stockcodes, (list, tuple)):
+            raise ValueError("stockcodes must be a list or tuple")
+
+        details = {}
+        for value in stockcodes:
+            code = str(value or "").strip()
+            if not code or code in details:
+                continue
+            try:
+                details[code] = self.get_option_detail_data(code) or {}
+            except Exception as exc:
+                log.warning("get_option_detail_data failed for %s: %s", code, exc)
+                details[code] = {}
+        return details
 
     def get_option_undl_data(self, undl_code_ref=""):
         # ContextInfo stub: get_option_undl_data(undl_code_ref='') — 标的下所有期权。

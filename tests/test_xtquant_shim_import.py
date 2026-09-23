@@ -106,6 +106,27 @@ class ShimSurfaceTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("raised", result.stdout)
 
+    def test_get_full_tick_forwards_types(self):
+        from xtquant import xtdata
+
+        calls = []
+
+        class FakeXtData:
+            @staticmethod
+            def get_full_tick(code_list, types=None):
+                calls.append((code_list, types))
+                return {"ok": True}
+
+        original = xtdata._compat.xtdata
+        xtdata._compat.xtdata = FakeXtData()
+        try:
+            result = xtdata.get_full_tick(["SH"], types=["stock", "etf"])
+        finally:
+            xtdata._compat.xtdata = original
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(calls, [(["SH"], ["stock", "etf"])])
+
 
 class ConstantValueTest(unittest.TestCase):
     """The port added 443 constants; the 90 that already existed must keep

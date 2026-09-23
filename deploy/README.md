@@ -31,6 +31,11 @@ powershell -ExecutionPolicy Bypass -File .\deploy_qmt_bridge.ps1 `
 下载/解压 Redis → 注册 Windows 服务（bind 127.0.0.1 + 随机密码 + 192mb 上限）→
 生成服务端/客户端配置 → 放入 `qmt_cli.py`。
 
+**Redis 下载慢/中断**（GitHub Releases 国内直连不稳）三种出路，按速度排序：
+1. `-RedisZip "C:\path\Redis-x64-5.0.14.zip"` 离线传入（最快，一次拷贝终身用）
+2. `-RedisUrl "https://<镜像>/...zip"` 自定义下载源（公共 gh 加速时快时慢，建议实测后固定）
+3. `-Proxy http://...` 走代理下载官方源
+
 **离线服务器**：先在别的机器下载 Redis zip，
 加参数 `-RedisZip "C:\temp\Redis-x64-5.0.14.zip"`（PyPI 下载仍需网络，或提前做好 venv 拷贝过去）。
 

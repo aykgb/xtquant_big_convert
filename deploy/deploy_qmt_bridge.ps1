@@ -17,6 +17,7 @@ param(
     [Parameter(Mandatory=$true)][string]$Account,
     [string]$WorkDir = "C:\qmt_bridge",
     [string]$RedisZip = "",
+    [string]$RedisUrl = "",
     [string]$Proxy = "",
     [switch]$CheckOnly,
     [switch]$AllowOrders,
@@ -152,14 +153,45 @@ Ok "copied to $dst"
 Step "3/7 redis 5.0.14"
 $rdir = "$WorkDir\redis"
 $zip  = "$rdir\Redis-x64-5.0.14.zip"
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+function Test-RedisZip([string]$Path) {
+    if (-not (Test-Path $Path)) { return $false }
+    try {
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        try { return [bool]($archive.Entries | Where-Object { $_.Name -eq "redis-server.exe" }) }
+        finally { $archive.Dispose() }
+    } catch { return $false }
+}
+$explicitZip = [bool]$RedisZip
 if (-not $RedisZip) { $RedisZip = $zip }
-if (-not (Test-Path $RedisZip)) {
+if (-not (Test-RedisZip $RedisZip)) {
+    # An explicitly passed archive is the caller's: never download over it.
+    # The default path is ours: missing means first run, broken means an
+    # interrupted download -- both go to the download below.
+    if ($explicitZip) {
+        if (-not (Test-Path $RedisZip)) { throw "RedisZip not found: $RedisZip" }
+        throw "RedisZip is not a valid redis archive (must contain redis-server.exe): $RedisZip"
+    }
     New-Item -ItemType Directory -Force $rdir | Out-Null
-    $dlArgs = @("-L","--max-time","600","-o",$RedisZip,
-      "https://github.com/tporadowski/redis/releases/download/v5.0.14/Redis-x64-5.0.14.zip")
+    if (Test-Path $RedisZip) {
+        Info "removing incomplete redis archive: $RedisZip"
+        Remove-Item -LiteralPath $RedisZip -Force
+    }
+    $downloadZip = "$zip.download"
+    # Windows PowerShell 5.1 (what the README runs this with) has no
+    # if-expression: `(if ...)` inside an array is parsed as a command
+    # named "if". Pick the source first, then build the argument list.
+    $source = "https://github.com/tporadowski/redis/releases/download/v5.0.14/Redis-x64-5.0.14.zip"
+    if ($RedisUrl) { $source = $RedisUrl }
+    $dlArgs = @("-L","--connect-timeout","20","--retry","3","--retry-delay","2","--max-time","1800",
+      "-o",$downloadZip,$source)
     if ($Proxy) { $dlArgs = @("-x",$Proxy) + $dlArgs }
     & curl.exe @dlArgs
-    if ($LASTEXITCODE -ne 0) { throw "redis download failed (github.com unreachable; pass -RedisZip <path> for offline use, or add -Proxy http://...)" }
+    if ($LASTEXITCODE -ne 0 -or -not (Test-RedisZip $downloadZip)) {
+        if (Test-Path $downloadZip) { Remove-Item -LiteralPath $downloadZip -Force }
+        throw "redis download failed or incomplete (pass -RedisZip <path> for offline use, -RedisUrl <mirror> for an alternate source, or add -Proxy http://...)"
+    }
+    Move-Item -LiteralPath $downloadZip -Destination $RedisZip -Force
 }
 if (-not (Test-Path "$rdir\Redis-x64-5.0.14\redis-server.exe")) {
     Expand-Archive $RedisZip "$rdir\Redis-x64-5.0.14" -Force

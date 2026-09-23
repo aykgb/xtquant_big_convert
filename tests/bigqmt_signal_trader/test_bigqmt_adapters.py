@@ -274,6 +274,25 @@ class BigQmtAdaptersTest(unittest.TestCase):
             BigQmtMarketDataProvider(context).get_ticks([token])
             self.assertEqual(context.asked, [[token]], token)
 
+    def test_option_exchange_tokens_reach_qmt_instead_of_raising(self):
+        """SHO/SZO are native QMT market tokens, not instrument codes.
+
+        The adapter must pass them through so the running terminal can answer
+        whether its build supports whole-option-market snapshots.
+        """
+        class FakeCtx:
+            def __init__(self):
+                self.asked = []
+
+            def get_full_tick(self, codes):
+                self.asked.append(list(codes))
+                return {}
+
+        for token in ("SHO", "SZO"):
+            context = FakeCtx()
+            BigQmtMarketDataProvider(context).get_ticks([token])
+            self.assertEqual(context.asked, [[token]], token)
+
     def test_a_futures_token_is_never_narrowed_to_stocks(self):
         """A futures exchange lists only futures -- the token already says what
         it holds, so there is nothing to narrow and no A-share sector to use."""
