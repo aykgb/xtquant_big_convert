@@ -61,6 +61,17 @@ Homepage = "https://github.com/litaolemo/xtquant_big_convert"
 Repository = "https://github.com/litaolemo/xtquant_big_convert.git"
 Issues = "https://github.com/litaolemo/xtquant_big_convert/issues"
 
+[tool.uv]
+# 默认缓存键只有 pyproject.toml：版本号不变时改了源码，path 依赖方 uv sync 会复用旧 wheel，
+# 客户端悄悄停在旧代码上。只列进包的文件：src/**/* 会带上 __pycache__，src/**/*.txt 会带上
+# 每次构建都被重写的 egg-info，两者都会让每次 sync 都重建。
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "src/**/*.py" },
+    { file = "src/bigqmt_signal_trader/*.md" },
+    { file = "src/bigqmt_signal_trader/_singlefile/*.txt" },
+]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 py-modules = [
