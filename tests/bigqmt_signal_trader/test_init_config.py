@@ -287,6 +287,19 @@ class PromptFlowTest(unittest.TestCase):
 
         self.assertIn("任何能连上这条通道的程序都可以下单", script.text())
 
+    def test_qmt_python_dir_can_be_preset_so_the_wizard_does_not_ask(self):
+        """sync_bigqmt_to_qmt.py init passes --dst here: the dir the wrapper
+        syncs to must be the dir the wizard writes the server config to."""
+        script = _Script(answers=["8886800503"] + [""] * 11)
+        answers = init_config.prompt_answers(
+            script.write, script.read, read_secret=script.read_secret,
+            qmt_python_dir=r"D:\QMT\python")
+
+        self.assertEqual(answers["qmt_python_dir"], r"D:\QMT\python")
+        self.assertNotIn("QMT 的 python 目录（回车则写到当前目录）",
+                         "".join(script.prompts))
+        self.assertIn("由调用方指定", script.text())
+
 
 class ApplyTest(unittest.TestCase):
     def setUp(self):

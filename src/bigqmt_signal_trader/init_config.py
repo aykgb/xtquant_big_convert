@@ -376,7 +376,7 @@ def _ask_int(write, read, question, default):
             write("  需要一个整数。\n")
 
 
-def prompt_answers(write, read, read_secret=None):
+def prompt_answers(write, read, read_secret=None, qmt_python_dir=None):
     answers = dict(DEFAULTS)
 
     write("\n=== Big QMT 桥接配置 ===\n")
@@ -426,8 +426,14 @@ def prompt_answers(write, read, read_secret=None):
         answers["transport"] = "zmq"
         write("  单文件无 redis 版强制使用 zmq 传输。\n")
 
-    answers["qmt_python_dir"] = _ask(
-        write, read, "QMT 的 python 目录（回车则写到当前目录）", "")
+    if qmt_python_dir is None:
+        answers["qmt_python_dir"] = _ask(
+            write, read, "QMT 的 python 目录（回车则写到当前目录）", "")
+    else:
+        # 调用方已经知道 QMT 的 python 目录（就是它马上要 sync 过去的 --dst），
+        # 再问一遍正是「向导写一个路径、sync 同步到另一个路径」的来源。
+        answers["qmt_python_dir"] = str(qmt_python_dir)
+        write("QMT 的 python 目录由调用方指定: %s\n" % answers["qmt_python_dir"])
     answers["client_dir"] = _ask(
         write, read, "客户端配置写到哪个目录（回车则当前目录）", "")
     return answers
@@ -587,6 +593,9 @@ def main(argv=None):
                         help="已存在的文件直接覆盖，不再询问")
     parser.add_argument("--repo-root", default=None,
                         help="仓库根目录（单文件构建需要 tools/ 下的生成器）")
+    parser.add_argument("--qmt-python-dir", default=None, metavar="DIR",
+                        help="QMT 的 python 目录；给定后向导不再询问这一项"
+                             "（sync_bigqmt_to_qmt.py init --dst 会传入）")
     args = parser.parse_args(argv)
 
     repo_root = args.repo_root or os.path.dirname(
@@ -596,7 +605,7 @@ def main(argv=None):
     read = lambda prompt: input(prompt)  # noqa: E731 -- injected in tests
 
     try:
-        answers = prompt_answers(write, read)
+        answers = prompt_answers(write, read, qmt_python_dir=args.qmt_python_dir)
         written = apply(answers, repo_root, write, read, force=args.force)
     except KeyboardInterrupt:
         write("\n已取消，未写入任何文件。\n")
