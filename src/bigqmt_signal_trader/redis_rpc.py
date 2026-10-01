@@ -1922,7 +1922,10 @@ class BigQmtRpcHandlers:
         return rows
 
     _ORDER_IDENTITY_LOCAL_LIMIT = 5000
-    _ORDER_IDENTITY_LOCAL_TTL_SECONDS = 86400.0
+    # 7 days, matching exec_events.ORDER_IDENTITY_TTL_SECONDS: orders stay
+    # queryable across days, and a next-day re-read used to come back
+    # renamed under the bridge process (#393).
+    _ORDER_IDENTITY_LOCAL_TTL_SECONDS = 7 * 86400.0
 
     def _remember_order_identity_local(self, account_id, remark, strategy_name):
         remark = str(remark or "").strip()
@@ -1935,7 +1938,24 @@ class BigQmtRpcHandlers:
                 # Tests (and the QMT sandbox) build handlers via __new__ and
                 # skip __init__ -- create on first use.
                 journal = self._order_identity_local = collections.OrderedDict()
-            journal[key] = (time.time(), str(strategy_name or ""))
+            name = str(strategy_name or "")
+            existing = journal.get(key)
+            if existing is not None:
+                existing_name = existing[1]
+                if existing_name and existing_name != name:
+                    # First NAMED record wins (#393): a reused remark must
+                    # not rename rows already reported -- an unconditional
+                    # overwrite flipped them to the latest same-remark
+                    # submit's name, or erased it entirely when that submit
+                    # passed "" and rows fell back to the QMT process name.
+                    if name:
+                        print("[bigqmt_rpc] order remark %r reused across "
+                              "strategies: keeping %r, ignoring %r (#393). "
+                              "Pass a unique remark per order."
+                              % (remark, existing_name, name))
+                    journal.move_to_end(key)
+                    return
+            journal[key] = (time.time(), name)
             journal.move_to_end(key)
             while len(journal) > self._ORDER_IDENTITY_LOCAL_LIMIT:
                 journal.popitem(last=False)
@@ -4750,6 +4770,7 @@ class RedisPubSubRpcService:
                 except Exception:
                     pass  # record stays "processing": replays answer ambiguous
             return self._refuse_expired(request, response, method, waited, order_key)
+        _t0 = _t1 = _t_json1 = None
         try:
             if canonical_order_method:
                 self.handlers._order_dispatch_state = "pre_dispatch"
@@ -4765,6 +4786,11 @@ class RedisPubSubRpcService:
                 _t1 = time.perf_counter()
                 self._note_slow_request(method, _t1 - _t0)
             response["data"] = to_jsonable(result)
+            # to_jsonable is where a big answer burns its time (#386: 12.7MB
+            # of 5m bars took ~11s here on the serve side while the handler
+            # itself was fast, and nothing logged it -- the slow-request note
+            # covers only the handler segment).
+            _t_json1 = time.perf_counter()
             response["ok"] = True
             # Surface server-side diagnostics when the handler recorded one.
             server_error = getattr(self.handlers, "_last_server_error", None)
@@ -4822,7 +4848,7 @@ class RedisPubSubRpcService:
                     (exc.__class__.__name__, exc))
         if order_key is not None:
             self._remember_order_response(order_key, response, state="settled")
-        _t_pub0 = time.perf_counter() if method == "ping" else 0.0
+        _t_pub0 = time.perf_counter()
         try:
             self._publish_response(request, response)
         except Exception:
@@ -4837,6 +4863,8 @@ class RedisPubSubRpcService:
                 )
             except Exception:
                 pass
+        _t_pub1 = time.perf_counter()
+        self._note_slow_response(method, _t0, _t1, _t_json1, _t_pub0, _t_pub1)
         if method == "ping":
             # Logged AFTER publish: this print goes to the QMT output panel,
             # which costs ~1 adjust tick of GIL wait on the serving thread --
@@ -4879,6 +4907,47 @@ class RedisPubSubRpcService:
                 "slow request method=%s took %.1fs thread=%s (#342: this is "
                 "what an [adjust_phase] drain of the same size was inside)",
                 method, seconds, thread_name)
+        except Exception:
+            pass
+
+    def _note_slow_response(self, method, t_handle0, t_handle1, t_json_done,
+                            t_pub0, t_pub1):
+        """Segmented slow note for the time AROUND the handler (#386).
+
+        The handler-level note above covers only ``handlers.handle``; a big
+        answer then burns its real time in ``to_jsonable`` and the publish,
+        neither of which any log named -- a 60-code 40-day 5m read spent
+        ~11.5s server-side with zero slow lines. Fires only when the TOTAL
+        exceeds ``slow_request_seconds`` while the handler segment alone did
+        not (otherwise the handler note already named it). Never raises:
+        this runs on the adjust thread too.
+        """
+        if t_handle0 is None or t_handle1 is None:
+            return
+        try:
+            threshold = float(self.slow_request_seconds)
+        except Exception:
+            threshold = 1.0
+        if threshold <= 0:
+            return
+        handle = t_handle1 - t_handle0
+        total = t_pub1 - t_handle0
+        if total < threshold or handle >= threshold:
+            return
+        jsonable = (t_json_done - t_handle1) if t_json_done is not None else -1.0
+        publish = t_pub1 - t_pub0
+        try:
+            thread_name = threading.current_thread().name
+        except Exception:
+            thread_name = "?"
+        try:
+            from .logging_setup import get_logger
+            get_logger("rpc").warning(
+                "slow response method=%s total=%.1fs handle=%.1fs "
+                "to_jsonable=%.1fs publish=%.1fs thread=%s (#386: the slow "
+                "part is the reply conversion/send, not the handler -- "
+                "consider chunk_size or a narrower window)",
+                method, total, handle, jsonable, publish, thread_name)
         except Exception:
             pass
 
