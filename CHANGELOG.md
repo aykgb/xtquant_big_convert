@@ -3,7 +3,16 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.61] - 2026-10-01
+
+### 升级注意
+
+- 本次含**策略文件**（`bigqmt_signal_trader_strategy.py`）改动：#393 的 reload 身份 journal 移交
+  只有策略重启后才生效——`reload_deployment` 刷不了策略入口文件本身。常规 `sync + reload` 会让
+  除该移交外的全部修复立即生效；建议安排一次策略重启拿全。
+- #386 的分段慢日志（`slow response ... to_jsonable=... publish=...`）只在总时长超
+  `slow_request_seconds` 且 handler 段未超时时出现；看到它说明瓶颈在回复转换/发送，
+  应用侧用 `chunk_size` 分批或收窄窗口即可。
 
 ### 修复
 
