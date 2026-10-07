@@ -58,7 +58,10 @@ class ReplayFailureDoesNotKillTheLoopTest(unittest.TestCase):
             session.replay_subscriptions()
         self.assertEqual(active, {"A", "C"})
 
+        clock = [time.monotonic()]
+
         def fake_sleep(_seconds):
+            clock[0] += _seconds
             if rounds[0] < 3:
                 self.assertEqual(active, {"A", "C"})
             rounds[0] += 1
@@ -66,7 +69,7 @@ class ReplayFailureDoesNotKillTheLoopTest(unittest.TestCase):
                 session._started = False
 
         session._started = True
-        with mock.patch("time.sleep", fake_sleep):
+        with mock.patch("time.sleep", fake_sleep), mock.patch("time.monotonic", lambda: clock[0]):
             session._heartbeat_loop()
         self.assertEqual(active, {"A", "B", "C"})
         self.assertEqual(attempts, {"A": 5, "B": 5, "C": 5})  # Stop replaying once the batch succeeds.
