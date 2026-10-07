@@ -4966,10 +4966,10 @@ class BigQmtXtTrader:
         topics = sorted(set(EXEC_TOPICS.values()))
         channel = None
         account_id = str(self.client.account_id or "")
+        self._trade_events_ready = False
         try:
             channel = self._build_quote_push_channel()
             channel.start_subscriber(topics, self._on_push_exec_event)
-            self._trade_events_ready = False
             self._last_event_error = (
                 "push transport has no durable cursor replay")
             self._event_ready.set()          # see the redis path (#247)
@@ -4978,7 +4978,9 @@ class BigQmtXtTrader:
                     return       # account changed -> rebuild against the new address
                 time.sleep(0.5)
         except Exception:
-            self._trade_events_ready = False
+            # 静默重试养大了 #366（方法不存在 -> AttributeError -> 永远收不到
+            # 回调，外面什么都看不见）。失败必须留痕。
+            log.exception("exec event push-channel round failed; retrying")
             time.sleep(1.0)
         finally:
             if channel is not None:

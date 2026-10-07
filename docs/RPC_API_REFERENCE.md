@@ -391,6 +391,7 @@ FormulaServer 直连不认这个参数，带上它会强制回落到 RPC 桥（�
 （`"STOCK"` / `"CREDIT"` / `"FUTURE"` / `"HUGANGTONG"` / `"SHENGANGTONG"` / ...，或 xtconstant 的数字）：
 客户端 `StockAccount(id, "HUGANGTONG")` 的类型就是这样传来的。服务端只在该账号配置允许时按它查
 （`BIGQMT_ACCOUNT_TYPE` 或 `BIGQMT_ACCOUNT_TYPE_MAP` 的值写成列表），否则按配置的默认类型答并记一次日志。
+HUGANGTONG / SHENGANGTONG 例外：不在配置列表里也按所请求的类型查询，避免把 A 股资金和持仓作为港股通结果返回。
 
 ### `get_asset`
 - **别名**：`query_stock_asset`
